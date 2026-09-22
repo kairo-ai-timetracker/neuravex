@@ -23,6 +23,21 @@ logger = logging.getLogger("neuravex.tasks")
 # picked their own list in Settings.
 _DEFAULT_SYMBOLS = ["WMATIC/USDC", "WETH/USDC"]
 
+# Hard, fixed backstop on the loss side for a single live position — NOT
+# user-configurable (same "ik doe en denk zo weinig mogelijk" reasoning as
+# AccountSettings.DEFAULT_*). This is deliberately NOT the AI's normal exit
+# mechanism (that's agent.py's signal-driven close, which can and should
+# exit earlier/smarter than this) — it's a pure noodrem: if a position's
+# unrealized loss reaches this amount, it is sold immediately regardless of
+# what the AI's own analysis says, in case that analysis is ever wrong,
+# slow, or the tick pipeline hiccups. Expected to fire rarely, if ever.
+_HARD_STOP_LOSS_USDC = -10.0
+
+# Threshold for the portfolio-equity-movement alert (see
+# check_equity_movement below) — a plain fixed number, not user-configurable
+# for the same reason as the other constants here.
+_EQUITY_ALERT_THRESHOLD_USDC = 5.0
+
 
 def _get_or_create_settings(session, account: m.Account) -> m.AccountSettings:
     row = session.query(m.AccountSettings).filter_by(account_id=account.id).first()
@@ -357,5 +372,99 @@ def check_live_exits() -> str:
                         "Live take-profit triggered for account %s %s: unrealized %.2f >= target %.2f",
                         account.id, position.symbol, unrealized_profit, account_settings.max_balance_target,
                     )
+                elif unrealized_profit <= _HARD_STOP_LOSS_USDC:
+                    # Pure noodrem — see _HARD_STOP_LOSS_USDC's comment.
+                    # This is deliberately separate from the AI's own
+                    # signal-driven close (agent.py's SHORT-on-held-symbol
+                    # path), which is expected to exit earlier/smarter than
+                    # this in almost every case; this only fires as a
+                    # backstop if that hasn't happened.
+                    store.save_pending_execution(
+                        account.id, None,
+                        PlannedOrder(
+                            symbol=position.symbol, side="sell", quantity=position.quantity,
+                            stop_loss=0.0, take_profit_1=0.0, take_profit_2=0.0, confidence=1.0,
+                            reasons_for=[
+                                f"Hard stop-loss backstop: unrealized loss "
+                                f"{unrealized_profit:.2f} USDC <= {_HARD_STOP_LOSS_USDC:.2f} USDC"
+                            ],
+                            reasons_against=[],
+                        ),
+                    )
+                    logger.warning(
+                        "Hard stop-loss triggered for account %s %s: unrealized %.2f <= %.2f",
+                        account.id, position.symbol, unrealized_profit, _HARD_STOP_LOSS_USDC,
+                    )
+
+    return "ok"
+
+
+@celery_app.task(name="backend.app.core.tasks.check_equity_movement")
+def check_equity_movement() -> str:
+    """
+    Fires a portfolio-equity-movement notification (email now, in-app push
+    once the phone polls for it — see /api/notifications) whenever a live
+    account's total equity has moved by _EQUITY_ALERT_THRESHOLD_USDC or more
+    since the last alert. Deliberately simple: one running "last alerted
+    equity" baseline per account (the most recent PendingNotification of
+    kind "equity_move"), not a fixed schedule or percentage — so a fast
+    move triggers as soon as this task next runs (every 2 minutes, see
+    celery_app.py) rather than waiting for a calendar boundary.
+
+    Simulation accounts are skipped entirely — this is about real money
+    moving, not a fictional balance.
+    """
+    from trading_engine.alerts import send_email
+
+    with get_session() as session:
+        accounts = session.query(m.Account).all()
+        for account in accounts:
+            account_settings = _get_or_create_settings(session, account)
+            if account_settings.paper_trading_enabled:
+                continue
+
+            latest_snapshot = (
+                session.query(m.PortfolioSnapshot)
+                .filter_by(account_id=account.id, is_simulated=False)
+                .order_by(m.PortfolioSnapshot.taken_at.desc())
+                .first()
+            )
+            if latest_snapshot is None or latest_snapshot.equity <= 0:
+                continue
+            current_equity = latest_snapshot.equity
+
+            last_alert = (
+                session.query(m.PendingNotification)
+                .filter_by(account_id=account.id, kind="equity_move")
+                .order_by(m.PendingNotification.created_at.desc())
+                .first()
+            )
+            baseline = last_alert.meta.get("equity") if last_alert else None
+            if baseline is None:
+                # First run ever for this account — establish a baseline
+                # silently (pre-marked delivered so the app never sees it
+                # as a notification to show).
+                session.add(m.PendingNotification(
+                    account_id=account.id, kind="equity_move", title="", body="",
+                    meta={"equity": current_equity}, delivered_at=datetime.utcnow(),
+                ))
+                continue
+
+            delta = current_equity - baseline
+            if abs(delta) < _EQUITY_ALERT_THRESHOLD_USDC:
+                continue
+
+            direction = "gestegen" if delta > 0 else "gedaald"
+            title = f"NEURAVEX: portfolio {direction}"
+            body = f"Je portfolio is €{abs(delta):.2f} {direction} sinds de laatste melding, nu €{current_equity:.2f}."
+            session.add(m.PendingNotification(
+                account_id=account.id, kind="equity_move", title=title, body=body,
+                meta={"equity": current_equity},
+            ))
+            logger.info(
+                "Equity movement alert for account %s: %+.2f -> %.2f (threshold %.2f)",
+                account.id, delta, current_equity, _EQUITY_ALERT_THRESHOLD_USDC,
+            )
+            send_email(title, body)
 
     return "ok"

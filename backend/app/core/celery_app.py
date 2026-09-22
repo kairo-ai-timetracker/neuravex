@@ -47,4 +47,10 @@ celery_app.conf.beat_schedule = {
         # resolution is one minute, and this needs to be faster than that.
         "schedule": 30.0,
     },
+    "neuravex-equity-movement-check": {
+        "task": "backend.app.core.tasks.check_equity_movement",
+        # Every 2 minutes — frequent enough to catch a fast move without
+        # emailing/notifying on every tiny fluctuation between checks.
+        "schedule": 120.0,
+    },
 }

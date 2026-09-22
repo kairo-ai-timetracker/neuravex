@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +12,8 @@ from backend.app.api.auth import require_account_owner
 from backend.app.db.session import get_db
 from backend.app.models import models as m
 from backend.app.schemas.schemas import AccountOverview, DailyDecisionStats, DecisionOut, PositionOut
+
+logger = logging.getLogger("neuravex.dashboard")
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -197,6 +200,17 @@ def get_daily_stats(
     ]
 
 
+class AssetBalanceIn(BaseModel):
+    """One held asset, as the app's own wallet/DEX balance check already
+    computes it (see PolygonDexExecutionClient.getPortfolioValue() —
+    previously only summed into the single `equity` total below and
+    discarded per-asset, so the backend had no idea WHICH coins were
+    actually held)."""
+    symbol: str = Field(description="Bare asset symbol, e.g. 'WETH', 'WMATIC', 'WBTC' — not a pair")
+    quantity: float = Field(gt=0)
+    price_usd: float = Field(gt=0, description="Current price per unit, USD/USDC-equivalent")
+
+
 class ReportBalanceRequest(BaseModel):
     # ge=0 (not gt=0): a genuinely empty wallet is a valid, real state that
     # should display as $0.00, not be rejected outright. An earlier gt=0
@@ -211,6 +225,50 @@ class ReportBalanceRequest(BaseModel):
     # the P/L baseline, so an older app version reporting a partial total
     # can never set a baseline that a later full report would exceed.
     full_wallet: bool = False
+    # Optional (default empty, so an older app version stays compatible)
+    # per-asset breakdown — see _reconcile_untracked_positions below.
+    assets: list[AssetBalanceIn] = Field(default_factory=list)
+
+
+def _reconcile_untracked_positions(db: Session, account_id: str, assets: list[AssetBalanceIn]) -> None:
+    """
+    Adopts any real wallet holding that isn't yet tracked as an open
+    `Position` row, so the AI's own exit logic (agent.py's SHORT-on-held-
+    symbol close) and the fixed/hard-stop safety nets (check_live_exits)
+    can actually see and manage it — previously these coins were entirely
+    invisible to that machinery, since it only ever reads the `positions`
+    table, and simply holding a token in the wallet never wrote a row
+    there (only a bot-initiated buy did, via _apply_fill_to_position).
+
+    Deliberately conservative: only creates a position when NONE already
+    exists for that symbol — never adjusts or re-averages an existing
+    one, to avoid corrupting a real entry price the bot already tracks
+    with a blended guess. For a coin adopted this way, there is no way to
+    recover what was originally paid for it, so entry_price is set to
+    today's reported price — P/L on it is measured from the moment of
+    adoption forward, not from whenever it was actually acquired.
+    """
+    for asset in assets:
+        symbol = asset.symbol.upper()
+        if symbol == "USDC" or asset.quantity <= 0:
+            continue
+        pair_symbol = f"{symbol}/USDC"
+        existing = (
+            db.query(m.Position)
+            .filter_by(account_id=account_id, symbol=pair_symbol, status=m.PositionStatus.open)
+            .first()
+        )
+        if existing is not None:
+            continue
+        db.add(m.Position(
+            account_id=account_id, symbol=pair_symbol, side=m.OrderSide.buy,
+            quantity=asset.quantity, entry_price=asset.price_usd,
+        ))
+        logger.info(
+            "Adopted untracked wallet holding as a position: account %s %s qty=%.6f @ %.6f "
+            "(cost basis = today's price, original purchase price unknown)",
+            account_id, pair_symbol, asset.quantity, asset.price_usd,
+        )
 
 
 @router.post("/{account_id}/report-balance")
@@ -242,6 +300,9 @@ def report_balance(
         is_simulated=False,
     )
     db.add(snapshot)
+
+    if req.assets:
+        _reconcile_untracked_positions(db, account_id, req.assets)
 
     settings_row = _get_or_create_settings(db, account_id)
     if (

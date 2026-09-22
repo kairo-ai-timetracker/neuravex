@@ -341,3 +341,33 @@ class PendingExecution(Base):
     failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class PendingNotification(Base):
+    """
+    A one-shot notification the phone should show as a local Android
+    notification, mirroring PendingExecution's poll-and-claim shape but
+    much simpler (no claiming, just a delivered/undelivered flag — a
+    notification being shown twice is harmless, unlike a trade being
+    executed twice). Currently only produced by check_equity_movement
+    (tasks.py) for portfolio-move alerts (kind="equity_move"), but the
+    `kind` field exists so other alert types can reuse this table later
+    without a schema change.
+
+    This is a brand-new table — unlike most other tables in this file, it
+    was never renamed/retrofitted around a pre-existing live-database
+    schema, so every column here is exactly what create_all() will
+    provision on first deploy.
+    """
+    __tablename__ = "pending_notifications"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"))
+    kind: Mapped[str] = mapped_column(String(30))
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(String(1000))
+    # Per-kind bookkeeping — for kind="equity_move" this holds
+    # {"equity": <float>}, the running baseline the next check compares
+    # against (see check_equity_movement's docstring).
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

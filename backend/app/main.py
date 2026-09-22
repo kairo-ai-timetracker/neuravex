@@ -20,6 +20,7 @@ from backend.app.api.backtest import router as backtest_router
 from backend.app.api.dashboard import router as dashboard_router
 from backend.app.api.emergency import router as emergency_router
 from backend.app.api.execution import router as execution_router
+from backend.app.api.notifications import router as notifications_router
 from backend.app.api.settings import router as settings_router
 from backend.app.api.websocket import router as websocket_router
 from backend.app.core.rate_limit import RateLimitMiddleware
@@ -56,6 +57,7 @@ app.include_router(auth_router)
 app.include_router(dashboard_router)
 app.include_router(backtest_router)
 app.include_router(execution_router)
+app.include_router(notifications_router)
 app.include_router(settings_router)
 app.include_router(emergency_router)
 app.include_router(websocket_router)
