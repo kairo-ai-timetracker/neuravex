@@ -143,6 +143,18 @@ class Strategy(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
     name: Mapped[str] = mapped_column(String(100), unique=True)
     family: Mapped[str] = mapped_column(String(50))
+    # Present on the live database from an earlier schema version (same
+    # situation as Order.updated_at / Position.take_profit_1/2 above) but
+    # never declared here until this — every insert of a NEW strategy row
+    # (save_signal in sql_data_store.py, on first use of a given strategy
+    # name) omitted these and got rejected with "null value in column
+    # is_active violates not-null constraint" the moment a strategy that
+    # wasn't already seeded in the table got used for the first time.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    params: Mapped[dict] = mapped_column(JSON, default=dict)
+    historical_win_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    historical_expectancy: Mapped[float] = mapped_column(Float, default=0.0)
+    total_signals: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Signal(Base):
