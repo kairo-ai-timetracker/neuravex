@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <application
+        android:name=".NeuravexApplication"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.Neuravex"
+        android:usesCleartextTraffic="true">
+        <!-- !! TEMPORARY, FOR LOCAL WIFI TESTING ONLY !!
+             true here allows plain http:// traffic (e.g. to your laptop's
+             local IP like 192.168.1.23:8000) so you can test against a
+             backend that doesn't have HTTPS set up yet. Once you deploy
+             to a real server with a domain (see docs/DEPLOYMENT.md, which
+             gives you https://api.yourdomain.com via Caddy), set this
+             back to "false" before using the app for anything real — an
+             app that accepts cleartext is more exposed to network-level
+             tampering (e.g. on a public wifi network) than one that only
+             ever speaks HTTPS. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Neuravex">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.TradingExecutionService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+    </application>
+</manifest>

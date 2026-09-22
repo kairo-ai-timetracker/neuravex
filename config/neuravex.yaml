@@ -1,0 +1,16 @@
+trading:
+  mode: paper  # paper | live (live also needs NEURAVEX_ALLOW_LIVE=true)
+risk:
+  max_trade_risk: 0.01
+  max_daily_loss: 0.03
+  max_drawdown: 0.10
+  max_open_positions: 5
+  max_leverage: 1.0
+strategy:
+  minimum_confidence: 0.70
+  minimum_expected_edge: 0.003
+  cooldown_seconds: 900
+  max_trades_per_hour: 4
+  min_time_between_entries_seconds: 300
+execution:
+  slippage_limit: 0.005

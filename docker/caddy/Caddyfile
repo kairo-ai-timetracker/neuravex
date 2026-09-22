@@ -1,0 +1,10 @@
+# Replace "yourdomain.com" below with your real domain before starting
+# this stack.
+
+api.yourdomain.com {
+    reverse_proxy backend:8000
+}
+
+yourdomain.com {
+    reverse_proxy frontend:3000
+}
