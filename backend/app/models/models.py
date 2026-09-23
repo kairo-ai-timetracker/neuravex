@@ -155,6 +155,17 @@ class Strategy(Base):
     historical_win_rate: Mapped[float] = mapped_column(Float, default=0.0)
     historical_expectancy: Mapped[float] = mapped_column(Float, default=0.0)
     total_signals: Mapped[int] = mapped_column(Integer, default=0)
+    # Denominator for the running-average updates to historical_win_rate/
+    # historical_expectancy above — deliberately a SEPARATE counter from
+    # total_signals (which counts every signal this strategy ever
+    # produced, most of which never become a trade at all, let alone a
+    # CLOSED, attributable one). See execution.py's
+    # _update_strategy_performance, the only place this is incremented.
+    # NEW COLUMN — requires a manual `ALTER TABLE strategies ADD COLUMN
+    # IF NOT EXISTS closed_trades_count INTEGER NOT NULL DEFAULT 0;` on
+    # the live database (same situation as is_active/params/etc. above —
+    # create_all() never alters an existing table).
+    closed_trades_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Signal(Base):
@@ -193,6 +204,16 @@ class AIDecision(Base):
     take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
     risk_reward: Mapped[float | None] = mapped_column(Float, nullable=True)
     executed: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Clean list of strategy names that voted for this decision's direction
+    # (from Decision.contributing_signals) — e.g. ["momentum", "breakout"].
+    # Previously the only record of this was free-text inside reasons_for
+    # ("momentum: LONG confidence 82%"), unusable for attribution without
+    # string-parsing. This is what lets a later-closed Position (via its
+    # opening_decision_id) credit/blame the RIGHT strategies for its
+    # result — see execution.py's _update_strategy_performance.
+    # NEW COLUMN — requires a manual `ALTER TABLE ai_decisions ADD COLUMN
+    # IF NOT EXISTS contributing_strategies JSON;` on the live database.
+    contributing_strategies: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -270,6 +291,34 @@ class Position(Base):
     take_profit_2: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[PositionStatus] = mapped_column(Enum(PositionStatus), default=PositionStatus.open)
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # The three fields below close the strategy-performance feedback loop
+    # (see decision_engine.py's strategy_performance_score, which existed
+    # from the start but had nothing real feeding it until now). Set by
+    # execution.py's _apply_fill_to_position / _update_strategy_performance,
+    # never by agent.py directly.
+    #   - opening_decision_id: which ai_decisions row (and therefore which
+    #     strategies, via its contributing_strategies) opened this
+    #     position. Set once, on the FIRST buy fill; a later add-on buy
+    #     deliberately does NOT overwrite it — a position added to over
+    #     time is still credited as one trade to whichever strategy(ies)
+    #     called the original entry.
+    #   - realized_pnl: accumulated (price_sold - entry_price) * qty_sold
+    #     across every sell fill against this position, in USDC. None
+    #     until the first sell fill against it.
+    #   - closed_at: set once, when quantity reaches ~0.
+    # Positions opened before this feature existed, or adopted from an
+    # untracked wallet balance (see dashboard.py's
+    # _reconcile_untracked_positions), have opening_decision_id = None —
+    # there's no decision to trace back to, so they simply don't
+    # contribute to any strategy's stats when they eventually close.
+    # NEW COLUMNS — requires a manual `ALTER TABLE positions ADD COLUMN
+    # IF NOT EXISTS opening_decision_id VARCHAR(36); ALTER TABLE positions
+    # ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION; ALTER TABLE
+    # positions ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;` on the live
+    # database.
+    opening_decision_id: Mapped[str | None] = mapped_column(ForeignKey("ai_decisions.id"), nullable=True)
+    realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class PortfolioSnapshot(Base):

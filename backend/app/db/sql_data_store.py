@@ -91,6 +91,13 @@ class SqlDataStore:
             strategy = m.Strategy(name=signal.strategy_name, family=getattr(signal, "family", "unknown"))
             self.session.add(strategy)
             self.session.flush()
+        # Was declared on the model but never actually incremented anywhere
+        # — always stuck at its default of 0 regardless of how many
+        # signals a strategy produced. Separate from closed_trades_count
+        # (which only counts CLOSED, attributed trades, used for the
+        # win-rate running average) — this one is exactly what its name
+        # says: every signal, whether or not it ever became a trade.
+        strategy.total_signals += 1
         safe_details = _json_safe(signal.details)
         row = m.Signal(
             strategy_id=strategy.id, symbol=symbol, direction=signal.direction,
@@ -106,7 +113,32 @@ class SqlDataStore:
         )
         self.session.add(row)
 
-    def save_decision(self, decision: Decision, account_id: str) -> None:
+    def save_decision(self, decision: Decision, account_id: str) -> str:
+        """
+        Idempotent by design: the FIRST call for a given Decision object
+        inserts a new ai_decisions row and stamps decision.id onto the
+        object; every later call for that SAME object (identified by
+        decision.id already being set) UPDATEs the fields that can still
+        change after the initial save (reasons_for/against, executed)
+        instead of inserting a duplicate row.
+        Why this matters: agent.py needs a real ai_decisions.id to stamp
+        onto the PendingExecution/Order it's about to create — BEFORE the
+        decision's final reasons_for text and executed flag are known —
+        so it calls this once early (see _process_symbol/_close_position)
+        to mint that id, then run_tick()'s own call (as before this
+        change) fills in the final state on the same row. Returns the id
+        either way, for callers (agent.py) that need it immediately.
+        """
+        if decision.id is not None:
+            row = self.session.query(m.AIDecision).filter_by(id=decision.id).first()
+            if row is not None:
+                row.reasons_for = decision.reasons_for
+                row.reasons_against = decision.reasons_against
+                row.executed = decision.executed
+                return decision.id
+            # Row vanished somehow (shouldn't happen) — fall through and
+            # insert fresh rather than silently losing this decision.
+
         row = m.AIDecision(
             account_id=account_id, symbol=decision.symbol,
             action=m.DecisionAction(decision.action) if decision.action in m.DecisionAction.__members__.values() else m.DecisionAction.no_trade,
@@ -119,9 +151,16 @@ class SqlDataStore:
             final_score=_json_safe(decision.score.final_score) if decision.score else 0.0,
             score_breakdown=_json_safe(vars(decision.score)) if decision.score else {},
             reasons_for=decision.reasons_for, reasons_against=decision.reasons_against,
+            contributing_strategies=[s.strategy_name for s in decision.contributing_signals],
             executed=decision.executed,
         )
         self.session.add(row)
+        # Needed to populate row.id from the DB default (gen_uuid) before
+        # any caller can use it — without this, row.id is None until the
+        # session actually commits/flushes on its own schedule.
+        self.session.flush()
+        decision.id = row.id
+        return row.id
 
     def save_order_result(self, order_result, decision_id: str | None, account_id: str) -> None:
         row = m.Order(

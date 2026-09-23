@@ -48,7 +48,7 @@ class PlannedOrder:
 
 class DataStore(Protocol):
     def save_signal(self, symbol: str, signal) -> None: ...
-    def save_decision(self, decision: Decision, account_id: str) -> None: ...
+    def save_decision(self, decision: Decision, account_id: str) -> str: ...
     def save_order_result(self, order_result, decision_id: str | None, account_id: str) -> None: ...
     def save_risk_event(self, event_type: str, severity: str, message: str, context: dict) -> None: ...
     def save_pending_execution(self, account_id: str, decision_id: str | None, plan: PlannedOrder) -> None: ...
@@ -282,6 +282,19 @@ class NeuravexAgent:
             return decision
 
         # 11. Decision already made (BUY/SELL) — 12. Execute if approved
+        #
+        # Minted HERE, before either execution path, not left for
+        # run_tick()'s later save_decision() call: this is what stamps a
+        # real ai_decisions.id onto the PendingExecution/Order about to be
+        # created, which is in turn what lets a position opened by this
+        # trade trace back to the strategies that called it (see
+        # execution.py's _apply_fill_to_position / _update_strategy_
+        # performance). save_decision() is idempotent on an already-set
+        # decision.id, so run_tick()'s own call afterwards just updates
+        # this same row with the final reasons_for/executed state instead
+        # of inserting a duplicate.
+        decision_id = self.store.save_decision(decision, self.account_id)
+
         if self.config.execution_mode == "phone":
             # This process never touches an exchange secret. It hands off a
             # fully risk-checked, self-expiring order description for the
@@ -291,7 +304,7 @@ class NeuravexAgent:
                 stop_loss=plan.stop_loss, take_profit_1=plan.take_profit_1, take_profit_2=plan.take_profit_2,
                 confidence=decision.confidence, reasons_for=decision.reasons_for, reasons_against=decision.reasons_against,
             )
-            self.store.save_pending_execution(self.account_id, None, planned)
+            self.store.save_pending_execution(self.account_id, decision_id, planned)
             decision.executed = True
             return decision
 
@@ -301,7 +314,7 @@ class NeuravexAgent:
         )
         side = Side.buy if direction == "LONG" else Side.sell
         order_result = await self.exchange.create_order(symbol, side, OrderType.market, size.quantity)
-        self.store.save_order_result(order_result, None, self.account_id)
+        self.store.save_order_result(order_result, decision_id, self.account_id)
         decision.executed = True
         return decision
 
@@ -321,6 +334,14 @@ class NeuravexAgent:
             logger.info("DRY RUN — would close %s qty=%.6f (AI trading is off)", symbol, quantity)
             return decision
 
+        # See the matching comment in _process_symbol — minted early so the
+        # PendingExecution/Order below carries a real decision_id. Not
+        # actually needed for strategy attribution (a CLOSE's decision
+        # never becomes a Position's opening_decision_id — that stays
+        # fixed to whichever decision originally opened it), but kept
+        # consistent with the entry path for record-keeping.
+        decision_id = self.store.save_decision(decision, self.account_id)
+
         if self.config.execution_mode == "phone":
             planned = PlannedOrder(
                 symbol=symbol, side="sell", quantity=quantity,
@@ -330,7 +351,7 @@ class NeuravexAgent:
                 confidence=decision.confidence, reasons_for=decision.reasons_for,
                 reasons_against=decision.reasons_against,
             )
-            self.store.save_pending_execution(self.account_id, None, planned)
+            self.store.save_pending_execution(self.account_id, decision_id, planned)
             decision.executed = True
             return decision
 
@@ -339,6 +360,6 @@ class NeuravexAgent:
             allow_live_flag=self.config.allow_live_flag, confirm_live=(self.config.trading_mode == "live"),
         )
         order_result = await self.exchange.create_order(symbol, Side.sell, OrderType.market, quantity)
-        self.store.save_order_result(order_result, None, self.account_id)
+        self.store.save_order_result(order_result, decision_id, self.account_id)
         decision.executed = True
         return decision

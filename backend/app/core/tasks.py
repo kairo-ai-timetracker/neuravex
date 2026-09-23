@@ -38,6 +38,44 @@ _HARD_STOP_LOSS_USDC = -10.0
 # for the same reason as the other constants here.
 _EQUITY_ALERT_THRESHOLD_USDC = 5.0
 
+# A strategy needs at least this many CLOSED, attributed trades (see
+# Strategy.closed_trades_count, updated by execution.py's
+# _update_strategy_performance) before its win rate is trusted at all in
+# _compute_strategy_performance below. Below this, one lucky or unlucky
+# early trade could swing a brand-new strategy's win rate straight to 0%
+# or 100% — it's treated as unproven (neutral, 0.0) instead, same as
+# before this feature existed.
+_MIN_TRADES_FOR_PERFORMANCE_WEIGHTING = 5
+
+
+def _compute_strategy_performance(session) -> dict[str, float]:
+    """
+    Feeds decision_engine.score_signals()'s strategy_performance_score
+    term (weight 0.15 in the final ensemble score) with real numbers for
+    the first time — that term existed from the start, but nothing ever
+    computed historical_win_rate, so every strategy scored a flat 0.0
+    regardless of its actual track record. See execution.py's
+    _update_strategy_performance for where these numbers actually get
+    updated, the moment a live position closes.
+
+    Deliberately win-rate only, not historical_expectancy — expectancy is
+    raw USDC-per-unit-of-token, which sits on wildly different scales
+    across symbols (a fraction of a WBTC unit vs. a whole unit of a
+    $0.02 altcoin) and would swamp or vanish depending on which token a
+    strategy happened to fire on, not how good it actually was. Win rate
+    is scale-free: mapped from 0..1 to -1..1 around a neutral 50%, so a
+    strategy winning more than half its closed trades nudges its future
+    signals up, one winning less than half nudges them down — and
+    decision_engine's own 0.15 weight on this term keeps it a nudge, not
+    a veto, exactly like every other score component.
+    """
+    rows = (
+        session.query(m.Strategy)
+        .filter(m.Strategy.closed_trades_count >= _MIN_TRADES_FOR_PERFORMANCE_WEIGHTING)
+        .all()
+    )
+    return {s.name: max(-1.0, min(1.0, 2 * (s.historical_win_rate - 0.5))) for s in rows}
+
 
 def _get_or_create_settings(session, account: m.Account) -> m.AccountSettings:
     row = session.query(m.AccountSettings).filter_by(account_id=account.id).first()
@@ -270,6 +308,7 @@ def run_agent_tick() -> str:
             agent = NeuravexAgent(
                 exchange=exchange, strategies=strategies, store=store,
                 config=config, account_id=account.id,
+                strategy_performance=_compute_strategy_performance(session),
             )
             try:
                 decisions = asyncio.run(agent.run_tick())

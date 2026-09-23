@@ -136,6 +136,13 @@ def _apply_fill_to_position(db: Session, execution: m.PendingExecution) -> None:
                 quantity=qty, entry_price=price,
                 stop_loss=execution.stop_loss, take_profit_1=execution.take_profit_1,
                 take_profit_2=execution.take_profit_2,
+                # Which ai_decisions row (and therefore which strategies)
+                # opened this position — see _update_strategy_performance
+                # below, which is what eventually reads this back. Only
+                # set on a genuinely NEW position; an add-on buy below
+                # deliberately leaves an existing position's
+                # opening_decision_id untouched.
+                opening_decision_id=execution.decision_id,
             ))
         else:
             total_qty = existing.quantity + qty
@@ -144,7 +151,71 @@ def _apply_fill_to_position(db: Session, execution: m.PendingExecution) -> None:
     else:
         if existing is None:
             return
+        # Realized P&L for THIS fill, in USDC (spot/long-only — see the
+        # side=buy hardcoded above; there is no short-position variant to
+        # branch on). Accumulated across however many sell fills it takes
+        # to fully close the position, since check_live_exits and agent.py
+        # both normally sell the full held quantity in one fill, but
+        # nothing here assumes that.
+        realized = (price - existing.entry_price) * qty
+        existing.realized_pnl = (existing.realized_pnl or 0.0) + realized
+        # Captured BEFORE zeroing existing.quantity below — this is what
+        # _update_strategy_performance normalizes realized_pnl by. In the
+        # normal case (every exit path in this codebase sells the FULL
+        # held quantity in one fill — see agent.py/_close_position and
+        # tasks.py/check_live_exits) this equals the position's entire
+        # size; using existing.quantity AFTER it's zeroed would divide by
+        # zero and silently fall back to the raw (non-per-unit) total.
+        quantity_closed = existing.quantity
         existing.quantity -= qty
         if existing.quantity <= 1e-9:
             existing.status = m.PositionStatus.closed
             existing.quantity = 0.0
+            existing.closed_at = datetime.utcnow()
+            _update_strategy_performance(db, existing, quantity_closed)
+
+
+def _update_strategy_performance(db: Session, position: m.Position, quantity_closed: float) -> None:
+    """
+    Closes the feedback loop decision_engine.score_signals() was always
+    built for (its strategy_performance_score term) but that nothing ever
+    actually computed until now: whichever strategies contributed to the
+    decision that OPENED this position (position.opening_decision_id ->
+    AIDecision.contributing_strategies) get their historical_win_rate and
+    historical_expectancy updated from this position's real, realized
+    P&L — via a running average, so this never needs to replay past
+    trades. NeuravexAgent picks the updated numbers back up on the very
+    next tick (see tasks.py's _compute_strategy_performance), fed into
+    exactly the score term that was always there waiting for it.
+
+    Deliberately per-unit (realized_pnl / quantity), not the raw total —
+    a strategy shouldn't look better or worse just because a particular
+    trade happened to be sized bigger or smaller.
+
+    A position with no opening_decision_id (opened before this feature
+    existed, or adopted from an untracked wallet balance — see
+    dashboard.py's _reconcile_untracked_positions) has no strategy to
+    credit or blame, and is skipped entirely: silently doing nothing is
+    correct here, not a bug to paper over.
+    """
+    if position.opening_decision_id is None or not position.realized_pnl:
+        return
+    opening_decision = db.query(m.AIDecision).filter_by(id=position.opening_decision_id).first()
+    if opening_decision is None or not opening_decision.contributing_strategies:
+        return
+
+    pnl_per_unit = position.realized_pnl / quantity_closed if quantity_closed else position.realized_pnl
+    won = position.realized_pnl > 0
+
+    for strategy_name in opening_decision.contributing_strategies:
+        strategy = db.query(m.Strategy).filter_by(name=strategy_name).first()
+        if strategy is None:
+            continue
+        n = strategy.closed_trades_count
+        new_n = n + 1
+        # Incremental (running) average — equivalent to recomputing the
+        # mean over every attributed trade so far, but as a single O(1)
+        # update rather than replaying history.
+        strategy.historical_win_rate = (strategy.historical_win_rate * n + (1.0 if won else 0.0)) / new_n
+        strategy.historical_expectancy = (strategy.historical_expectancy * n + pnl_per_unit) / new_n
+        strategy.closed_trades_count = new_n

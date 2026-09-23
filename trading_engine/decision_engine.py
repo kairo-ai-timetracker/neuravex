@@ -37,6 +37,16 @@ class Decision:
     reasons_for: list[str] = field(default_factory=list)
     reasons_against: list[str] = field(default_factory=list)
     contributing_signals: list[StrategySignal] = field(default_factory=list)
+    # Set by SqlDataStore.save_decision() the first time this decision is
+    # persisted, and left alone on every later call (which then UPDATEs
+    # the existing row instead of inserting a second one). This is what
+    # lets agent.py mint a real ai_decisions.id BEFORE creating the
+    # PendingExecution/Order that acts on this decision — needed so a
+    # later-closed Position can trace back to exactly which decision (and
+    # therefore which strategies, via contributing_signals below) opened
+    # it. See execution.py's _update_strategy_performance for the other
+    # end of that chain.
+    id: str | None = None
     # Set by the agent (not scored here — this class only decides WHAT to
     # do, not whether it actually happened) right before a trade is
     # genuinely placed: a real order (server execution) or handed off to
