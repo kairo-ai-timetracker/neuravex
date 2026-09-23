@@ -191,6 +191,31 @@ class SqlDataStore:
         )
         self.session.add(row)
 
+    def has_pending_close(self, account_id: str, symbol: str) -> bool:
+        """
+        True if a sell for this symbol has already been proposed and isn't
+        resolved yet — either still waiting for the phone to pick it up
+        (status="pending") or already claimed by it but not yet reported
+        back as executed/failed (status="claimed"). Both count: the
+        window between claim and report can easily span a full
+        run_agent_tick cycle (a real on-chain confirmation + the phone
+        calling back /api/execution/{id}/report takes real time), and a
+        second close queued during that window is just as much a
+        duplicate as one queued while the first is still "pending".
+        Mirrors the identical guard tasks.py's check_live_exits already
+        uses for its own take-profit/stop-loss sweep (see its
+        `already_pending` check) — this gives agent.py's AI-judged close
+        path (trading_engine/agent.py's _process_symbol) the same
+        protection, which it was missing entirely.
+        """
+        return (
+            self.session.query(m.PendingExecution)
+            .filter_by(account_id=account_id, symbol=symbol, side=m.OrderSide.sell)
+            .filter(m.PendingExecution.status.in_(["pending", "claimed"]))
+            .first()
+            is not None
+        )
+
     def get_portfolio_state(self, account_id: str) -> PortfolioState:
         account = self.session.query(m.Account).filter_by(id=account_id).first()
         if account is None:

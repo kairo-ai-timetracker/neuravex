@@ -53,6 +53,7 @@ class DataStore(Protocol):
     def save_risk_event(self, event_type: str, severity: str, message: str, context: dict) -> None: ...
     def save_pending_execution(self, account_id: str, decision_id: str | None, plan: PlannedOrder) -> None: ...
     def get_portfolio_state(self, account_id: str) -> PortfolioState: ...
+    def has_pending_close(self, account_id: str, symbol: str) -> bool: ...
 
 
 @dataclass
@@ -217,6 +218,31 @@ class NeuravexAgent:
             if held_quantity <= 0:
                 decision.action = "NO_TRADE"
                 decision.reasons_against.append("No held quantity available to close")
+                return decision
+            # This tick's own PortfolioState was read at the START of
+            # run_tick() and only reflects the `positions` table — it does
+            # NOT know about a close that was already proposed (to the
+            # phone, or by check_live_exits' fixed take-profit/stop-loss
+            # sweep, which runs on its own much shorter ~30s schedule) but
+            # not yet executed/reported. Without this check, the exact same
+            # AI-judged SHORT signal firing again on the very next ~1-minute
+            # tick — before the phone has even had time to submit, confirm,
+            # and report back the FIRST close — would queue a second,
+            # overlapping "sell the full held quantity" order, and a third,
+            # and so on, every tick, for as long as the signal keeps firing
+            # and the position hasn't actually cleared yet. Each one is a
+            # real order the phone will claim and execute on-chain (real
+            # gas, real slippage), most of which fail or waste gas once the
+            # first one has already sold the position out from under them.
+            # check_live_exits already guards its own sweep this exact way
+            # (see tasks.py) — this mirrors that same guard for the AI's own
+            # signal-driven close, which was missing it entirely.
+            if self.store.has_pending_close(self.account_id, symbol):
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append(
+                    "A close for this position is already in flight (proposed but not yet "
+                    "executed/reported) — skipping to avoid a duplicate overlapping sell"
+                )
                 return decision
             decision.reasons_for.append(
                 f"AI-judged exit: closing full {symbol} position ({held_quantity:.6f}) on its own "
