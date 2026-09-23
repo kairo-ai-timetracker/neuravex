@@ -5,7 +5,14 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from backend.app.core.auth import AuthError, create_access_token, decode_access_token, hash_password, verify_password
+from backend.app.core.auth import (
+    AuthError,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    hash_password,
+    verify_password,
+)
 from backend.app.db.session import get_db
 from backend.app.models import models as m
 
@@ -19,7 +26,22 @@ class RegisterRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+def _issue_tokens(user_id: str) -> TokenResponse:
+    try:
+        return TokenResponse(
+            access_token=create_access_token(subject=user_id),
+            refresh_token=create_refresh_token(subject=user_id),
+        )
+    except AuthError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
@@ -36,11 +58,7 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)) -> TokenRespon
     account = m.Account(user_id=user.id, name="default")
     db.add(account)
 
-    try:
-        token = create_access_token(subject=user.id)
-    except AuthError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    return TokenResponse(access_token=token)
+    return _issue_tokens(user.id)
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -48,11 +66,27 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     user = db.query(m.User).filter_by(email=form_data.username).first()
     if user is None or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
+    return _issue_tokens(user.id)
+
+
+@router.post("/refresh", response_model=TokenResponse)
+def refresh(req: RefreshRequest, db: Session = Depends(get_db)) -> TokenResponse:
+    """Trades a still-valid refresh token for a brand-new access token AND
+    a brand-new refresh token (a sliding window — see the module
+    docstring in core/auth.py). Called automatically by the Android app's
+    OkHttp Authenticator the moment any request comes back 401, never
+    directly by the user, so this endpoint deliberately does NOT require
+    the (already-expired) access token via the normal Authorization
+    header — the refresh token in the body is its own proof of identity.
+    """
     try:
-        token = create_access_token(subject=user.id)
+        user_id = decode_token(req.refresh_token, expected_type="refresh")
     except AuthError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    return TokenResponse(access_token=token)
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    user = db.query(m.User).filter_by(id=user_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return _issue_tokens(user.id)
 
 
 from fastapi.security import OAuth2PasswordBearer
@@ -66,7 +100,7 @@ def get_current_user(
     if token is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        user_id = decode_access_token(token)
+        user_id = decode_token(token, expected_type="access")
     except AuthError as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
     user = db.query(m.User).filter_by(id=user_id).first()

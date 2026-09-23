@@ -178,8 +178,13 @@ class SqlDataStore:
             .filter_by(account_id=account_id, status=m.PositionStatus.open)
             .all()
         )
+        # quantity/entry_price (not just notional) are needed by agent.py to
+        # close a position on the AI's own sell signal — a full close sells
+        # the exact held quantity, not a freshly risk-sized amount, so the
+        # closing path needs the real quantity available here.
         open_positions = {
-            p.symbol: {"notional": p.quantity * p.entry_price} for p in open_positions_rows
+            p.symbol: {"notional": p.quantity * p.entry_price, "quantity": p.quantity, "entry_price": p.entry_price}
+            for p in open_positions_rows
         }
 
         return PortfolioState(

@@ -1,8 +1,26 @@
 """
 Authentication (spec §20). Password hashing via bcrypt (called directly —
-see note below), stateless JWT access tokens. Kept intentionally simple —
-no refresh-token rotation or OAuth here; add that before exposing this
-beyond a single-operator setup.
+see note below), stateless JWT access + refresh tokens.
+
+Access tokens are short-lived (ACCESS_TOKEN_EXPIRE_MINUTES) and are what
+every protected endpoint actually checks. Refresh tokens are long-lived
+(REFRESH_TOKEN_EXPIRE_MINUTES) and are only ever accepted by POST
+/api/auth/refresh, which mints a fresh access token (and a fresh refresh
+token — a sliding window) without the user having to re-enter a password.
+The Android app's OkHttp Authenticator (see ApiClientFactory.kt) calls
+that endpoint automatically the moment any request comes back 401, so as
+long as the app keeps polling at all (which it does, continuously, for
+trade execution), the session never actually expires from the user's
+point of view — this is what makes "leave the bot running for a
+week/month unattended" (the whole point of the app) actually hold, without
+making the access token itself long-lived and therefore a much bigger
+prize if the phone or the token were ever compromised.
+
+No server-side refresh-token revocation list — still intentionally simple
+for a single-operator setup. If a phone is lost, rotating
+NEURAVEX_SECRET_KEY immediately invalidates every access AND refresh token
+ever issued (everyone has to log in again) — that's the "kill switch" for
+a compromised device today.
 """
 from __future__ import annotations
 
@@ -22,7 +40,8 @@ from jose import JWTError, jwt
 _BCRYPT_MAX_PASSWORD_BYTES = 72  # bcrypt silently ignores bytes beyond this; truncate explicitly instead
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 12
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 12  # 12h — short-lived on purpose; refresh renews it silently
+REFRESH_TOKEN_EXPIRE_MINUTES = 60 * 24 * 90  # 90 days, and re-issued (sliding) on every refresh call
 
 
 class AuthError(Exception):
@@ -57,7 +76,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(password_bytes, hashed_password.encode("utf-8"))
 
 
-def create_access_token(subject: str) -> str:
+def _create_token(subject: str, token_type: str, expire_minutes: int) -> str:
     secret_key = _require_secret_key()
     # str(subject): defensively coerce here, not just at each call site.
     # `subject` is meant to always be a plain string (a user id), but on a
@@ -71,12 +90,29 @@ def create_access_token(subject: str) -> str:
     # "Object of type UUID is not JSON serializable" traceback that looks
     # unrelated to its actual cause. Coercing here means this can never
     # happen again regardless of what any caller passes in.
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"sub": str(subject), "exp": expire}
+    expire = datetime.now(timezone.utc) + timedelta(minutes=expire_minutes)
+    payload = {"sub": str(subject), "type": token_type, "exp": expire}
     return jwt.encode(payload, secret_key, algorithm=ALGORITHM)
 
 
-def decode_access_token(token: str) -> str:
+def create_access_token(subject: str) -> str:
+    return _create_token(subject, "access", ACCESS_TOKEN_EXPIRE_MINUTES)
+
+
+def create_refresh_token(subject: str) -> str:
+    return _create_token(subject, "refresh", REFRESH_TOKEN_EXPIRE_MINUTES)
+
+
+def decode_token(token: str, expected_type: str) -> str:
+    """Decodes a token and enforces it's the kind the caller actually
+    asked for — without this check, a leaked refresh token (which lives
+    far longer) could be used directly as an access token on any
+    protected endpoint, and an access token could be replayed against
+    /api/auth/refresh to keep minting new sessions past its own short
+    lifetime. Tokens issued before this "type" claim existed have neither
+    field, so they're treated as "access" for backward compatibility —
+    harmless, since no refresh tokens existed before this change either.
+    """
     secret_key = _require_secret_key()
     try:
         payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
@@ -85,4 +121,11 @@ def decode_access_token(token: str) -> str:
     subject = payload.get("sub")
     if subject is None:
         raise AuthError("Token has no subject")
+    token_type = payload.get("type", "access")
+    if token_type != expected_type:
+        raise AuthError(f"Wrong token type: expected {expected_type}, got {token_type}")
     return subject
+
+
+def decode_access_token(token: str) -> str:
+    return decode_token(token, "access")

@@ -99,6 +99,36 @@ class SecureCredentialStore(private val context: Context) {
         getBackendToken()
     }
 
+    // --- Backend refresh token ---------------------------------------------
+    // Long-lived (90 days, sliding — see core/auth.py on the backend)
+    // counterpart to the short-lived access token above. Stored the same
+    // encrypted way. Only ever sent to POST /api/auth/refresh, never
+    // attached to ordinary requests — see the Authenticator in
+    // ApiClientFactory.kt, which is the only thing that reads this
+    // blocking variant (same "already on a background thread" reasoning
+    // as getBackendTokenBlocking above: OkHttp's Authenticator.authenticate
+    // also never runs on the main thread).
+
+    suspend fun saveRefreshToken(token: String) {
+        context.secureDataStore.edit { prefs -> prefs[KEY_REFRESH_TOKEN] = encrypt(token) }
+    }
+
+    suspend fun getRefreshToken(): String? {
+        val stored = context.secureDataStore.data.first()[KEY_REFRESH_TOKEN] ?: return null
+        return decrypt(stored)
+    }
+
+    fun getRefreshTokenBlocking(): String? = kotlinx.coroutines.runBlocking {
+        getRefreshToken()
+    }
+
+    /** Saves both halves of a login/refresh response together, so callers
+     * never accidentally save one without the other. */
+    suspend fun saveBackendTokens(accessToken: String, refreshToken: String) {
+        saveBackendToken(accessToken)
+        saveRefreshToken(refreshToken)
+    }
+
     // --- Wallet private key (on-chain / MetaMask flow) --------------------
     // Stored through the exact same Tink+DataStore+Keystore pipeline as the
     // exchange API key above. Kept as a clearly separate key/method pair
@@ -156,6 +186,7 @@ class SecureCredentialStore(private val context: Context) {
         private val KEY_API_KEY = stringPreferencesKey("exchange_api_key")
         private val KEY_API_SECRET = stringPreferencesKey("exchange_api_secret")
         private val KEY_BACKEND_TOKEN = stringPreferencesKey("backend_jwt")
+        private val KEY_REFRESH_TOKEN = stringPreferencesKey("backend_refresh_jwt")
         private val KEY_WALLET_PRIVATE_KEY = stringPreferencesKey("wallet_private_key")
     }
 }

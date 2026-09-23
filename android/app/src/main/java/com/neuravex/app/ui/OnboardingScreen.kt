@@ -99,7 +99,8 @@ fun OnboardingScreen(configStore: AppConfigStore, onDone: () -> Unit) {
                             val api = ApiClientFactory.create(backendUrl.trimEnd('/'), credentialStore)
                             val response = api.login(email, password)
                             if (response.isSuccessful && response.body() != null) {
-                                credentialStore.saveBackendToken(response.body()!!.access_token)
+                                val body = response.body()!!
+                                credentialStore.saveBackendTokens(body.access_token, body.refresh_token)
                                 configStore.backendBaseUrl = backendUrl.trimEnd('/')
                                 loggedIn = true
                                 statusMessage = null

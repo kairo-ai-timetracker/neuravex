@@ -19,6 +19,13 @@ interface NeuravexApi {
         @Field("password") password: String,
     ): Response<TokenResponse>
 
+    // Not normally called directly — ApiClientFactory's OkHttp
+    // Authenticator calls this endpoint itself (via a bare OkHttpClient,
+    // not through Retrofit) the moment any request comes back 401. Kept
+    // here too so it's discoverable and directly testable.
+    @POST("/api/auth/refresh")
+    suspend fun refreshToken(@Body request: RefreshTokenRequest): Response<TokenResponse>
+
     @GET("/api/dashboard/{accountId}/overview")
     suspend fun getOverview(@Path("accountId") accountId: String): Response<AccountOverview>
 
@@ -72,4 +79,10 @@ interface NeuravexApi {
         @Path("accountId") accountId: String,
         @Body report: ReportBalanceRequest,
     ): Response<Unit>
+
+    @GET("/api/notifications/{accountId}/pending")
+    suspend fun getPendingNotifications(@Path("accountId") accountId: String): Response<List<PendingNotificationOut>>
+
+    @POST("/api/notifications/{notificationId}/ack")
+    suspend fun ackNotification(@Path("notificationId") notificationId: String): Response<Unit>
 }

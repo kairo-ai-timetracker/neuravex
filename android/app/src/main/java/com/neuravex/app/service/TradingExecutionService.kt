@@ -11,9 +11,11 @@ import com.neuravex.app.MainActivity
 import com.neuravex.app.R
 import com.neuravex.app.data.ApiClientFactory
 import com.neuravex.app.data.AppConfigStore
+import com.neuravex.app.data.AssetBalanceRequest
 import com.neuravex.app.data.BinanceExecutionClient
 import com.neuravex.app.data.EthereumMainnetBalanceChecker
 import com.neuravex.app.data.ExecutionRepository
+import com.neuravex.app.data.NeuravexApi
 import com.neuravex.app.data.PolygonDexExecutionClient
 import com.neuravex.app.data.ReportBalanceRequest
 import com.neuravex.app.security.SecureCredentialStore
@@ -23,6 +25,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Keeps polling the backend for approved trades and executes them with a
@@ -56,10 +59,12 @@ class TradingExecutionService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob())
     private var loopJob: Job? = null
+    private val alertNotificationCounter = AtomicInteger(2000)
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        createAlertNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -101,6 +106,11 @@ class TradingExecutionService : Service() {
                         delay(POLL_INTERVAL_WHEN_PAUSED_MS)
                         continue
                     }
+
+                    // Best-effort — a failed check here must never disrupt
+                    // the trade-execution loop below it (see the function's
+                    // own try/catch).
+                    checkPendingNotifications(api, accountId)
 
                     // Report the real wallet balance regardless of whether
                     // AI trading is on — same philosophy as dry-run
@@ -147,7 +157,15 @@ class TradingExecutionService : Service() {
                                 val fullWallet = ethResult?.complete == true
                                 val reportResponse = api.reportBalance(
                                     accountId,
-                                    ReportBalanceRequest(equity = combinedTotal, full_wallet = fullWallet),
+                                    ReportBalanceRequest(
+                                        equity = combinedTotal,
+                                        full_wallet = fullWallet,
+                                        assets = result.assets.map {
+                                            AssetBalanceRequest(
+                                                symbol = it.symbol, quantity = it.quantity, price_usd = it.priceUsd,
+                                            )
+                                        },
+                                    ),
                                 )
                                 // Written unconditionally (success or
                                 // $0.00) so the Dashboard always has the
@@ -241,6 +259,35 @@ class TradingExecutionService : Service() {
         return PolygonDexExecutionClient(privateKeyHex = privateKey)
     }
 
+    /**
+     * Polls the backend for one-off alerts (currently: portfolio moved by
+     * €5 or more — see check_equity_movement in tasks.py) and shows each
+     * as a normal Android notification, then acknowledges it so it's not
+     * shown again next poll. Reuses this service's existing polling loop
+     * rather than a separate WorkManager job, since this loop is already
+     * the thing reliably surviving in the background (see the class
+     * docstring on why a foreground service exists at all).
+     */
+    private suspend fun checkPendingNotifications(api: NeuravexApi, accountId: String) {
+        try {
+            val response = api.getPendingNotifications(accountId)
+            val pending = response.body() ?: return
+            for (n in pending) {
+                showAlertNotification(n.title, n.body)
+                try {
+                    api.ackNotification(n.id)
+                } catch (e: Exception) {
+                    // If the ack itself fails, the same alert may be shown
+                    // again next poll — harmless for a notification (unlike
+                    // a trade), so not worth retry logic here.
+                }
+            }
+        } catch (e: Exception) {
+            // Best-effort alert channel — never worth interrupting the
+            // main trade-execution loop for.
+        }
+    }
+
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID, "NEURAVEX trading", NotificationManager.IMPORTANCE_LOW,
@@ -248,6 +295,34 @@ class TradingExecutionService : Service() {
             description = "Ongoing notification while auto-execution is watching for approved trades"
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    private fun createAlertNotificationChannel() {
+        val channel = NotificationChannel(
+            ALERT_CHANNEL_ID, "NEURAVEX alerts", NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply {
+            description = "One-off alerts, e.g. when your portfolio moves by a meaningful amount"
+        }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    private fun showAlertNotification(title: String, body: String) {
+        val openAppIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentIntent(openAppIntent)
+            .setAutoCancel(true)
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        // A fresh id per alert (not the ongoing service's fixed
+        // NOTIFICATION_ID) so alerts stack in the tray instead of
+        // overwriting each other or the persistent trading notification.
+        manager.notify(alertNotificationCounter.incrementAndGet(), notification)
     }
 
     private fun buildNotification(text: String): Notification {
@@ -271,6 +346,7 @@ class TradingExecutionService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "neuravex_trading"
+        private const val ALERT_CHANNEL_ID = "neuravex_alerts"
         private const val NOTIFICATION_ID = 1001
         private const val POLL_INTERVAL_WHEN_PAUSED_MS = 30_000L
     }

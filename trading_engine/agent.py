@@ -187,6 +187,43 @@ class NeuravexAgent:
             return decision
 
         direction = decision.direction
+
+        # A SHORT signal on a symbol we already hold means "close this
+        # position", not "open a new short" — spot-only accounts can only
+        # sell what they hold (see the NO_TRADE guard below for the
+        # opposite case). This is the AI's OWN judgment call, independent
+        # of any fixed profit/loss number: it may close at a €0.05 profit
+        # if it doesn't expect the position to reach the account's
+        # per-trade take-profit target, or cut a loss early if it judges
+        # the trade unlikely to recover. That fixed target (max_balance_target,
+        # enforced separately by check_live_exits/_apply_per_trade_take_profit)
+        # stays as a guaranteed backstop on the profit side; it never
+        # blocks an earlier, smaller exit here.
+        #
+        # This MUST be handled before check_trade_against_limits: that
+        # function's "reject if a position is already open in this symbol"
+        # rule exists to stop the agent opening a SECOND position in the
+        # same symbol, but it does not distinguish that from an intentional
+        # close — every AI-driven close signal was previously vetoed by
+        # that exact check and silently turned into NO_TRADE, so the AI's
+        # own sell judgment never actually executed for a held position
+        # (only the fixed take-profit sweep, which bypasses this code path
+        # entirely, could ever close one). Closing sells the FULL held
+        # quantity directly, the same way check_live_exits' fixed sweep
+        # does — not a freshly risk-sized amount from calculate_position_size,
+        # which is meant for opening new positions, not exiting existing ones.
+        if direction == "SHORT" and symbol in state.open_positions:
+            held_quantity = state.open_positions[symbol].get("quantity", 0.0)
+            if held_quantity <= 0:
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append("No held quantity available to close")
+                return decision
+            decision.reasons_for.append(
+                f"AI-judged exit: closing full {symbol} position ({held_quantity:.6f}) on its own "
+                f"signal, not a fixed profit/loss threshold"
+            )
+            return await self._close_position(symbol, held_quantity, decision)
+
         entry = float(data.close[-1])
         atr_value = float(atr(data.high, data.low, data.close)[-1])
         plan = build_risk_plan(entry=entry, direction=direction, atr_value=atr_value)
@@ -264,6 +301,44 @@ class NeuravexAgent:
         )
         side = Side.buy if direction == "LONG" else Side.sell
         order_result = await self.exchange.create_order(symbol, side, OrderType.market, size.quantity)
+        self.store.save_order_result(order_result, None, self.account_id)
+        decision.executed = True
+        return decision
+
+    async def _close_position(self, symbol: str, quantity: float, decision: Decision) -> Decision:
+        """
+        Closes a held position at the AI's own initiative (called from
+        _process_symbol when a SHORT signal lands on a symbol we already
+        hold). Mirrors the two execution paths BUY/entry already uses
+        (phone hand-off vs. direct order) but always sells the FULL held
+        quantity — there is no position-sizing step here, since sizing is
+        a new-entry concept and this is an exit.
+        """
+        if self.config.dry_run:
+            decision.reasons_for.append(
+                f"Would SELL (close) {quantity:.6f} {symbol} — AI trading is currently off, nothing was executed"
+            )
+            logger.info("DRY RUN — would close %s qty=%.6f (AI trading is off)", symbol, quantity)
+            return decision
+
+        if self.config.execution_mode == "phone":
+            planned = PlannedOrder(
+                symbol=symbol, side="sell", quantity=quantity,
+                # No stop_loss/take_profit_1/2 on a close — those describe
+                # a NEW position's risk plan, which doesn't apply here.
+                stop_loss=0.0, take_profit_1=0.0, take_profit_2=0.0,
+                confidence=decision.confidence, reasons_for=decision.reasons_for,
+                reasons_against=decision.reasons_against,
+            )
+            self.store.save_pending_execution(self.account_id, None, planned)
+            decision.executed = True
+            return decision
+
+        assert_live_order_allowed(
+            exchange=self.exchange, trading_mode=self.config.trading_mode,
+            allow_live_flag=self.config.allow_live_flag, confirm_live=(self.config.trading_mode == "live"),
+        )
+        order_result = await self.exchange.create_order(symbol, Side.sell, OrderType.market, quantity)
         self.store.save_order_result(order_result, None, self.account_id)
         decision.executed = True
         return decision

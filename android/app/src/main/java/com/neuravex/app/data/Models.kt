@@ -104,19 +104,45 @@ data class AccountSettingsUpdate(
 )
 
 @Serializable
+data class AssetBalanceRequest(
+    val symbol: String,
+    val quantity: Double,
+    val price_usd: Double,
+)
+
+@Serializable
 data class ReportBalanceRequest(
     val equity: Double,
     val market_regime: String = "SIDEWAYS",
     // True only when `equity` covers the COMPLETE wallet (Polygon + Ethereum
     // mainnet). The backend only anchors the P/L baseline on such reports.
     val full_wallet: Boolean = false,
+    // Per-asset breakdown so the backend can adopt any coin that's held but
+    // not yet tracked as a position — see PolygonDexExecutionClient's
+    // AssetBalance and the backend's _reconcile_untracked_positions.
+    val assets: List<AssetBalanceRequest> = emptyList(),
+)
+
+@Serializable
+data class PendingNotificationOut(
+    val id: String,
+    val title: String,
+    val body: String,
+    val created_at: String,
 )
 
 @Serializable
 data class LoginRequest(val username: String, val password: String)
 
 @Serializable
-data class TokenResponse(val access_token: String, val token_type: String = "bearer")
+data class TokenResponse(val access_token: String, val refresh_token: String, val token_type: String = "bearer")
+
+/** Body for POST /api/auth/refresh — trades a still-valid refresh token
+ * for a brand-new access + refresh token pair, with no password involved.
+ * See ApiClientFactory's Authenticator, which calls this automatically
+ * the moment any request comes back 401. */
+@Serializable
+data class RefreshTokenRequest(val refresh_token: String)
 
 /** Coins available when trading via a CEX (Binance) — kept from the
  * original CEX-only flow. */

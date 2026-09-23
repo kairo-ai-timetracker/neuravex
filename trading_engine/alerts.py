@@ -48,6 +48,13 @@ def send_email(subject: str, message: str) -> bool:
     recipient = os.getenv("ALERT_EMAIL_TO")
     if not smtp_host or not sender or not recipient:
         return False
+    # Optional — needed for Gmail (and most real providers), which reject
+    # an unauthenticated connection outright. Left unset, behavior is
+    # unchanged from before (a bare, unauthenticated SMTP.send_message) for
+    # whatever open/local relay this originally targeted.
+    smtp_port = int(os.getenv("ALERT_EMAIL_SMTP_PORT", "587"))
+    smtp_user = os.getenv("ALERT_EMAIL_SMTP_USER")
+    smtp_password = os.getenv("ALERT_EMAIL_SMTP_PASSWORD")
     try:
         import smtplib
         from email.message import EmailMessage
@@ -56,7 +63,10 @@ def send_email(subject: str, message: str) -> bool:
         msg["From"] = sender
         msg["To"] = recipient
         msg.set_content(message)
-        with smtplib.SMTP(smtp_host) as server:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            if smtp_user and smtp_password:
+                server.starttls()
+                server.login(smtp_user, smtp_password)
             server.send_message(msg)
         return True
     except Exception as e:  # noqa: BLE001

@@ -343,11 +343,26 @@ class PolygonDexExecutionClient(
      * symptom was a flat $0.00 with no way to tell whether that meant
      * "wallet is genuinely empty" or "every RPC call failed silently."
      */
-    data class PortfolioValueResult(val totalUsdc: Double, val diagnostics: List<String>)
+    /** One held ERC-20 asset, structured (unlike `diagnostics`, which is
+     * human-readable text only) — this is what lets the backend actually
+     * know WHICH coins are held and at what price, so it can adopt them as
+     * tracked positions (see ReportBalanceRequest.assets / the backend's
+     * _reconcile_untracked_positions). Native MATIC is intentionally not
+     * included here — it has no PolygonTokenRegistry entry to buy/sell
+     * against, so the backend has nothing to track it as; WMATIC (the
+     * wrapped, tradable form) is what gets reported instead. */
+    data class AssetBalance(val symbol: String, val quantity: Double, val priceUsd: Double)
+
+    data class PortfolioValueResult(
+        val totalUsdc: Double,
+        val diagnostics: List<String>,
+        val assets: List<AssetBalance> = emptyList(),
+    )
 
     suspend fun getPortfolioValue(): PortfolioValueResult = withContext(Dispatchers.IO) {
         var total = BigDecimal.ZERO
         val diagnostics = mutableListOf<String>()
+        val assets = mutableListOf<AssetBalance>()
 
         try {
             val nativeBalanceWei = getNativeBalanceOrZero()
@@ -378,13 +393,20 @@ class PolygonDexExecutionClient(
                 if (token.symbol == "USDT" || token.symbol == "DAI") {
                     val usdValue = fromRawAmount(balance, token.decimals)
                     total = total.add(usdValue)
-                    diagnostics += "${token.symbol}: ${fromRawAmount(balance, token.decimals)} -> \$$usdValue (1:1 stablecoin)"
+                    val qty = fromRawAmount(balance, token.decimals)
+                    diagnostics += "${token.symbol}: $qty -> \$$usdValue (1:1 stablecoin)"
+                    assets += AssetBalance(token.symbol, qty.toDouble(), 1.0)
                 } else {
                     val quoted = quoteExactInputSingle(token.address, PolygonTokenRegistry.USDC.address, balance)
                     if (quoted != null) {
                         val usdValue = fromRawAmount(quoted, PolygonTokenRegistry.USDC.decimals)
                         total = total.add(usdValue)
-                        diagnostics += "${token.symbol}: ${fromRawAmount(balance, token.decimals)} -> \$$usdValue"
+                        val qty = fromRawAmount(balance, token.decimals)
+                        diagnostics += "${token.symbol}: $qty -> \$$usdValue"
+                        val qtyDouble = qty.toDouble()
+                        if (qtyDouble > 0.0) {
+                            assets += AssetBalance(token.symbol, qtyDouble, usdValue.toDouble() / qtyDouble)
+                        }
                     } else {
                         diagnostics += "${token.symbol}: balance=${fromRawAmount(balance, token.decimals)}, quote FAILED (no pool liquidity or RPC returned nothing)"
                     }
@@ -403,7 +425,7 @@ class PolygonDexExecutionClient(
             diagnostics += "USDC: lookup FAILED — ${e.javaClass.simpleName}: ${e.message}"
         }
 
-        PortfolioValueResult(totalUsdc = total.toDouble(), diagnostics = diagnostics)
+        PortfolioValueResult(totalUsdc = total.toDouble(), diagnostics = diagnostics, assets = assets)
     }
 
     /** Backward-compatible wrapper — returns only the total, for callers
