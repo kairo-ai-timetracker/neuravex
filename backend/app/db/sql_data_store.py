@@ -76,6 +76,19 @@ def _json_safe(value):
     return value
 
 
+def _safe_decision_action(action: str) -> "m.DecisionAction":
+    """
+    Value-based lookup into DecisionAction, defaulting to no_trade for any
+    value that doesn't match — never raises. See the long comment at this
+    function's call site (save_decision) for why this replaced an inline
+    membership check that looked equivalent but was always False.
+    """
+    try:
+        return m.DecisionAction(action)
+    except ValueError:
+        return m.DecisionAction.no_trade
+
+
 class SqlDataStore:
     def __init__(self, session: Session, simulated: bool = False, fallback_equity: float | None = None):
         self.session = session
@@ -141,7 +154,25 @@ class SqlDataStore:
 
         row = m.AIDecision(
             account_id=account_id, symbol=decision.symbol,
-            action=m.DecisionAction(decision.action) if decision.action in m.DecisionAction.__members__.values() else m.DecisionAction.no_trade,
+            # BUG (found while analyzing trade history — every row in this
+            # column had silently been "no_trade" since this table existed):
+            # `decision.action in m.DecisionAction.__members__.values()`
+            # compares a plain Python string ("BUY"/"SELL"/"NO_TRADE") against
+            # the ENUM MEMBERS themselves (DecisionAction.buy, ...), never
+            # their .value — DecisionAction is a plain PyEnum, not a str
+            # subclass, so that comparison is False for every input, and the
+            # ternary always fell through to the `else` branch. `executed`
+            # was never affected (it's a plain bool assigned directly), so
+            # `action` was the only column silently wrong — the dashboard's
+            # per-action breakdown, and any query filtering on it, has never
+            # reflected reality. `DecisionAction(decision.action)` on its own
+            # already does a correct VALUE-based lookup (that's how Enum's
+            # constructor works) — decision.action is always one of exactly
+            # "BUY"/"SELL"/"NO_TRADE" (see decision_engine.score_signals),
+            # which are exactly this enum's values, so the guard was never
+            # actually needed; kept as a defensive try/except in case that
+            # invariant is ever broken by a future caller.
+            action=_safe_decision_action(decision.action),
             # This scalar Float column is exactly what triggered
             # `psycopg2.errors.InvalidSchemaName: schema "np" does not
             # exist` — decision.score.final_score can be a numpy.float64
