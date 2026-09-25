@@ -403,14 +403,31 @@ class PendingNotification(Base):
     `kind` field exists so other alert types can reuse this table later
     without a schema change.
 
-    This is a brand-new table — unlike most other tables in this file, it
-    was never renamed/retrofitted around a pre-existing live-database
-    schema, so every column here is exactly what create_all() will
-    provision on first deploy.
+    This is a brand-new table, so unlike most other tables in this file it
+    was never itself retrofitted around a pre-existing live-database
+    schema — but account_id below WAS bitten by one anyway: this table's
+    creation (create_all(), via init_db()) failed outright with
+    `psycopg2.errors.DatatypeMismatch: foreign key constraint
+    "pending_notifications_account_id_fkey" cannot be implemented ...
+    character varying and uuid`. accounts.id is a native Postgres UUID
+    column on the live database (see _json_safe's docstring in
+    sql_data_store.py for the fuller story — this model file declares it
+    as String(36) everywhere, matching how every OTHER table's account_id
+    column was already created, back before — or around — whatever point
+    accounts.id actually became a real uuid column live). Every OTHER
+    table with an `account_id: Mapped[str] = mapped_column(ForeignKey(
+    "accounts.id"))` column already existed before that drift happened,
+    so their FK constraints were never re-validated against it; this was
+    the first BRAND-NEW table with that exact column shape to be created
+    since, and it's the first to hit this. Dropping the FK constraint
+    (keeping the plain column — every join in this codebase already
+    matches account_id by value, not by relying on the DB enforcing it)
+    is what actually lets create_all() provision this table; a real fix
+    for the accounts.id type drift itself is out of scope here.
     """
     __tablename__ = "pending_notifications"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
-    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"))
+    account_id: Mapped[str] = mapped_column(String(36))
     kind: Mapped[str] = mapped_column(String(30))
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(String(1000))
