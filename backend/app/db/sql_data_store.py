@@ -8,6 +8,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from backend.app.models import models as m
@@ -238,14 +239,73 @@ class SqlDataStore:
         `already_pending` check) — this gives agent.py's AI-judged close
         path (trading_engine/agent.py's _process_symbol) the same
         protection, which it was missing entirely.
+
+        A "pending" row additionally has to still be UNCLAIMED WITHIN ITS
+        WINDOW to count — see expire_stale_pending_executions' docstring
+        for why a naive `status == "pending"` check (which is what this
+        looked like in its first version, and what check_live_exits' own
+        already_pending check still does) can get permanently stuck true
+        forever for a row the phone never claimed in time, silently
+        blocking every future close attempt for that symbol. A "claimed"
+        row has no such window to check — claim_execution() (execution.py)
+        already refuses to claim anything past its expires_at, so every
+        claimed row was, by construction, claimed in time.
         """
+        now = datetime.utcnow()
         return (
             self.session.query(m.PendingExecution)
             .filter_by(account_id=account_id, symbol=symbol, side=m.OrderSide.sell)
-            .filter(m.PendingExecution.status.in_(["pending", "claimed"]))
+            .filter(
+                or_(
+                    m.PendingExecution.status == "claimed",
+                    and_(m.PendingExecution.status == "pending", m.PendingExecution.expires_at > now),
+                )
+            )
             .first()
             is not None
         )
+
+    def expire_stale_pending_executions(self, account_id: str) -> int:
+        """
+        Flips any PendingExecution row that's still "pending" (the phone
+        never claimed it) but whose expires_at has already passed to
+        "expired". Needed because claim_execution() (execution.py) is the
+        ONLY other place that ever sets status="expired", and it only runs
+        when the phone actually tries to claim a row — but GET /pending
+        already filters expired rows out of what it shows the phone (see
+        get_pending_executions), so a row the phone didn't get to in time
+        simply stops being offered to it and is never claimed, hence never
+        marked resolved either: it silently stays "pending" in the
+        database forever.
+
+        That "ghost pending" row doesn't just sit there harmlessly — every
+        guard in this codebase that skips a duplicate close by checking
+        for an existing "pending" sell (this class's has_pending_close,
+        and tasks.py's check_live_exits' own `already_pending` check) reads
+        it as "a close is still in flight" and refuses to queue a new one,
+        FOREVER — silently switching off both the AI's own close-on-signal
+        path and the fixed take-profit/hard-stop-loss safety net for that
+        one symbol, with no error or log anywhere. This is exactly what
+        happened live: a UNI/USDC sell created 2026-09-24 03:24 was never
+        claimed, and every close attempt for that symbol since — by either
+        mechanism — was silently swallowed by that one stale row.
+
+        Called from tasks.py's check_live_exits (already runs every ~30s
+        for every account, and already touches this table) so a stuck row
+        self-heals within about 30 seconds of expiring, instead of
+        blocking forever. Returns how many rows were flipped, purely so
+        the caller can log it.
+        """
+        now = datetime.utcnow()
+        stale = (
+            self.session.query(m.PendingExecution)
+            .filter_by(account_id=account_id, status="pending")
+            .filter(m.PendingExecution.expires_at < now)
+            .all()
+        )
+        for row in stale:
+            row.status = "expired"
+        return len(stale)
 
     def get_portfolio_state(self, account_id: str) -> PortfolioState:
         account = self.session.query(m.Account).filter_by(id=account_id).first()
