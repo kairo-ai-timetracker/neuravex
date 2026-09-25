@@ -4,6 +4,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+from sqlalchemy import func
+
 from backend.app.core.celery_app import celery_app
 from backend.app.core.config import settings as global_settings
 from backend.app.db.session import get_session
@@ -191,9 +193,29 @@ def _save_paper_snapshot(store: SqlDataStore, account_id: str, balances: dict[st
         price = next((p for sym, p in last_prices.items() if sym.startswith(f"{asset}/")), None)
         if price is not None:
             equity += amount * price
+
+    # BUG FIX (mirrors the equivalent fix in dashboard.py's report_balance,
+    # the live-wallet path): drawdown used to be hardcoded to 0.0 here, so
+    # a simulation account's dashboard always showed 0% drawdown no matter
+    # what — even while the SAME account-wide circuit breaker a live
+    # account can hit (trading_engine/risk/risk_engine.py's
+    # check_account_wide_limits, fed by SqlDataStore.get_portfolio_state's
+    # true historical peak_equity — run_agent_tick calls this for
+    # simulation accounts exactly the same as live ones) was tripped and
+    # silently halting this account's own trading. Both paths must agree
+    # on the same true-historical-peak definition of drawdown, not one
+    # hardcoded/partial and the other correct.
+    historical_peak_equity = (
+        store.session.query(func.max(m.PortfolioSnapshot.equity))
+        .filter_by(account_id=account_id, is_simulated=True)
+        .scalar()
+    )
+    peak_equity = max(equity, historical_peak_equity) if historical_peak_equity else equity
+    drawdown = (peak_equity - equity) / peak_equity if peak_equity else 0.0
+
     store.session.add(m.PortfolioSnapshot(
         account_id=account_id, equity=equity, cash=balances.get("USDC", 0.0),
-        exposure=0.0, drawdown=0.0, open_positions=sum(1 for a, v in balances.items() if a != "USDC" and v > 0),
+        exposure=0.0, drawdown=drawdown, open_positions=sum(1 for a, v in balances.items() if a != "USDC" and v > 0),
         market_regime="SIDEWAYS", taken_at=datetime.utcnow(), is_simulated=True,
     ))
 
