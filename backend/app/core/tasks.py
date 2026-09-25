@@ -472,9 +472,22 @@ def check_equity_movement() -> str:
                 continue
             current_equity = latest_snapshot.equity
 
+            # PendingNotification.account_id is a plain varchar with no FK
+            # (see its model docstring — accounts.id is a native uuid
+            # column in production, so a real FK there fails to create).
+            # account.id, read straight off that uuid column, comes back
+            # as an actual uuid.UUID object, and Postgres has no implicit
+            # "character varying = uuid" operator — comparing or inserting
+            # it as-is against this table raises psycopg2.UndefinedFunction.
+            # Every other table here still has a real FK to accounts.id,
+            # so their (also uuid, despite the String(36) declared here)
+            # live columns compare fine — this str() is needed for
+            # PendingNotification specifically, not those.
+            account_id_str = str(account.id)
+
             last_alert = (
                 session.query(m.PendingNotification)
-                .filter_by(account_id=account.id, kind="equity_move")
+                .filter_by(account_id=account_id_str, kind="equity_move")
                 .order_by(m.PendingNotification.created_at.desc())
                 .first()
             )
@@ -484,7 +497,7 @@ def check_equity_movement() -> str:
                 # silently (pre-marked delivered so the app never sees it
                 # as a notification to show).
                 session.add(m.PendingNotification(
-                    account_id=account.id, kind="equity_move", title="", body="",
+                    account_id=account_id_str, kind="equity_move", title="", body="",
                     meta={"equity": current_equity}, delivered_at=datetime.utcnow(),
                 ))
                 continue
@@ -497,7 +510,7 @@ def check_equity_movement() -> str:
             title = f"NEURAVEX: portfolio {direction}"
             body = f"Je portfolio is €{abs(delta):.2f} {direction} sinds de laatste melding, nu €{current_equity:.2f}."
             session.add(m.PendingNotification(
-                account_id=account.id, kind="equity_move", title=title, body=body,
+                account_id=account_id_str, kind="equity_move", title=title, body=body,
                 meta={"equity": current_equity},
             ))
             logger.info(
