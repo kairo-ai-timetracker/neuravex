@@ -34,6 +34,46 @@ class AppConfigStore(context: Context) {
         set(value) = prefs.edit().putString(KEY_LAST_BALANCE_DIAGNOSTICS, value).apply()
 
     /**
+     * The Polygon side of the most recent wallet-balance check, structured
+     * (unlike lastBalanceDiagnostics' raw text) so DashboardScreen can
+     * render a clean per-token "Tokens" list — symbol, quantity, USD
+     * value — the way a wallet app like MetaMask does, instead of a
+     * diagnostic log line per asset. Written by TradingExecutionService
+     * alongside lastBalanceDiagnostics. Deliberately left UNCHANGED when a
+     * balance check throws (see that call site) so the Dashboard keeps
+     * showing the last known good holdings alongside the error text,
+     * rather than the "Tokens" section going blank on a transient RPC
+     * hiccup. The Ethereum-mainnet side is never stored here — DashboardScreen
+     * reads that directly from its own EthereumMainnetBalanceChecker poll,
+     * exactly as before (see DashboardScreen's own LaunchedEffect).
+     *
+     * Persisted as a simple "symbol|network|quantity|usdValue" list joined
+     * by ";;" rather than JSON, to avoid pulling in a serialization
+     * dependency for four plain fields. Any entry that fails to parse is
+     * silently dropped rather than corrupting the whole list.
+     */
+    var lastHeldAssets: List<WalletHeldAsset>
+        get() {
+            val raw = prefs.getString(KEY_LAST_HELD_ASSETS, null) ?: return emptyList()
+            if (raw.isEmpty()) return emptyList()
+            return raw.split(";;").mapNotNull { entry ->
+                val parts = entry.split("|")
+                if (parts.size != 4) return@mapNotNull null
+                try {
+                    WalletHeldAsset(
+                        symbol = parts[0], network = parts[1],
+                        quantity = parts[2].toDouble(), usdValue = parts[3].toDouble(),
+                    )
+                } catch (e: NumberFormatException) {
+                    null
+                }
+            }
+        }
+        set(value) = prefs.edit()
+            .putString(KEY_LAST_HELD_ASSETS, value.joinToString(";;") { "${it.symbol}|${it.network}|${it.quantity}|${it.usdValue}" })
+            .apply()
+
+    /**
      * The user's own custom Polygon token (symbol, contract address,
      * decimals) — set from Settings, persisted here so it survives app
      * restarts, and loaded into PolygonTokenRegistry.setCustomToken() on
@@ -83,6 +123,7 @@ class AppConfigStore(context: Context) {
         private const val KEY_ACCOUNT_ID = "account_id"
         private const val KEY_POLL_INTERVAL = "poll_interval_seconds"
         private const val KEY_LAST_BALANCE_DIAGNOSTICS = "last_balance_diagnostics"
+        private const val KEY_LAST_HELD_ASSETS = "last_held_assets"
         private const val KEY_CUSTOM_SYMBOL = "custom_token_symbol"
         private const val KEY_CUSTOM_ADDRESS = "custom_token_address"
         private const val KEY_CUSTOM_DECIMALS = "custom_token_decimals"

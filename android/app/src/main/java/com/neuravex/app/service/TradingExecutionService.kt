@@ -178,6 +178,10 @@ class TradingExecutionService : Service() {
                                 val diagnosticsLines = result.diagnostics +
                                     (ethResult?.diagnostics ?: listOf("Ethereum mainnet: check failed, not included in total"))
                                 configStore.lastBalanceDiagnostics = diagnosticsLines.joinToString("\n")
+                                // Polygon-only, structured, for the Dashboard's
+                                // "Tokens" list — see AppConfigStore.lastHeldAssets
+                                // for why Ethereum mainnet isn't included here too.
+                                configStore.lastHeldAssets = result.heldAssets
                                 if (reportResponse.isSuccessful) {
                                     val text = if (combinedTotal == 0.0 && diagnosticsLines.isNotEmpty()) {
                                         "Balance: $0.00 — ${diagnosticsLines.joinToString("; ")}"
@@ -205,6 +209,7 @@ class TradingExecutionService : Service() {
                         // would otherwise keep showing stale real-wallet
                         // data from before simulation was switched on.
                         configStore.lastBalanceDiagnostics = "Simulation mode is on — real wallet balance is not checked. Switch to Live in Settings to see it again."
+                        configStore.lastHeldAssets = emptyList()
                         updateNotification("Simulation mode — watching AI decisions")
                     }
 

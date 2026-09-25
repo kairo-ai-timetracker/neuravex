@@ -159,6 +159,25 @@ object SupportedCoins {
  * address is not a bug that fails loudly, it is a swap that silently
  * sends funds somewhere unintended.
  */
+/**
+ * One token actually held in the wallet, purely for on-screen "Tokens"
+ * list display (DashboardScreen) — the way a wallet app like MetaMask
+ * shows what you own, across every network NEURAVEX can read: Polygon
+ * (traded — PolygonDexExecutionClient) and Ethereum mainnet (view-only —
+ * EthereumMainnetBalanceChecker). Deliberately NOT the same shape as
+ * PolygonDexExecutionClient.AssetBalance, which is sent to the backend to
+ * be adopted as a tradable position and therefore excludes native MATIC
+ * and USDC on purpose (see that class's doc) — a display list has no such
+ * restriction, so this one includes every nonzero, successfully-priced
+ * asset with no exceptions. Never sent over the network.
+ */
+data class WalletHeldAsset(
+    val symbol: String,
+    val network: String, // "Polygon" or "Ethereum"
+    val quantity: Double,
+    val usdValue: Double,
+)
+
 object SupportedPolygonCoins {
     // Every tradable base asset in PolygonTokenRegistry, quoted in USDC.
     // Rebuilt dynamically (not a fixed list) so the user's custom 14th

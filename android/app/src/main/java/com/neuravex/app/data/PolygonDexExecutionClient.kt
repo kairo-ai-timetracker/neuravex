@@ -353,16 +353,27 @@ class PolygonDexExecutionClient(
      * wrapped, tradable form) is what gets reported instead. */
     data class AssetBalance(val symbol: String, val quantity: Double, val priceUsd: Double)
 
+    // heldAssets below uses the shared WalletHeldAsset (see Models.kt) —
+    // every nonzero, successfully-priced balance INCLUDING native MATIC
+    // and USDC, unlike `assets` above. For on-screen display only, never
+    // sent to the backend's report-balance call, so it carries none of
+    // the risk `assets` deliberately avoids (the backend trying to adopt
+    // native MATIC or the quote currency itself as a tradable position —
+    // see AssetBalance's doc). Simply "what does the wallet actually hold
+    // and what's it worth right now", the same shape a wallet app shows.
+
     data class PortfolioValueResult(
         val totalUsdc: Double,
         val diagnostics: List<String>,
         val assets: List<AssetBalance> = emptyList(),
+        val heldAssets: List<WalletHeldAsset> = emptyList(),
     )
 
     suspend fun getPortfolioValue(): PortfolioValueResult = withContext(Dispatchers.IO) {
         var total = BigDecimal.ZERO
         val diagnostics = mutableListOf<String>()
         val assets = mutableListOf<AssetBalance>()
+        val heldAssets = mutableListOf<WalletHeldAsset>()
 
         try {
             val nativeBalanceWei = getNativeBalanceOrZero()
@@ -372,6 +383,7 @@ class PolygonDexExecutionClient(
                     val usdValue = fromRawAmount(quoted, PolygonTokenRegistry.USDC.decimals)
                     total = total.add(usdValue)
                     diagnostics += "MATIC (native): ${fromRawAmount(nativeBalanceWei, 18)} -> \$$usdValue"
+                    heldAssets += WalletHeldAsset("MATIC", "Polygon", fromRawAmount(nativeBalanceWei, 18).toDouble(), usdValue.toDouble())
                 } else {
                     diagnostics += "MATIC (native): balance=${fromRawAmount(nativeBalanceWei, 18)}, quote FAILED (no pool liquidity or RPC returned nothing)"
                 }
@@ -396,6 +408,7 @@ class PolygonDexExecutionClient(
                     val qty = fromRawAmount(balance, token.decimals)
                     diagnostics += "${token.symbol}: $qty -> \$$usdValue (1:1 stablecoin)"
                     assets += AssetBalance(token.symbol, qty.toDouble(), 1.0)
+                    heldAssets += WalletHeldAsset(token.symbol, "Polygon", qty.toDouble(), usdValue.toDouble())
                 } else {
                     val quoted = quoteExactInputSingle(token.address, PolygonTokenRegistry.USDC.address, balance)
                     if (quoted != null) {
@@ -406,6 +419,7 @@ class PolygonDexExecutionClient(
                         val qtyDouble = qty.toDouble()
                         if (qtyDouble > 0.0) {
                             assets += AssetBalance(token.symbol, qtyDouble, usdValue.toDouble() / qtyDouble)
+                            heldAssets += WalletHeldAsset(token.symbol, "Polygon", qtyDouble, usdValue.toDouble())
                         }
                     } else {
                         diagnostics += "${token.symbol}: balance=${fromRawAmount(balance, token.decimals)}, quote FAILED (no pool liquidity or RPC returned nothing)"
@@ -421,11 +435,14 @@ class PolygonDexExecutionClient(
             val usdValue = fromRawAmount(usdcBalance, PolygonTokenRegistry.USDC.decimals)
             total = total.add(usdValue)
             diagnostics += "USDC: \$$usdValue"
+            if (usdValue > BigDecimal.ZERO) {
+                heldAssets += WalletHeldAsset("USDC", "Polygon", fromRawAmount(usdcBalance, PolygonTokenRegistry.USDC.decimals).toDouble(), usdValue.toDouble())
+            }
         } catch (e: Exception) {
             diagnostics += "USDC: lookup FAILED — ${e.javaClass.simpleName}: ${e.message}"
         }
 
-        PortfolioValueResult(totalUsdc = total.toDouble(), diagnostics = diagnostics, assets = assets)
+        PortfolioValueResult(totalUsdc = total.toDouble(), diagnostics = diagnostics, assets = assets, heldAssets = heldAssets)
     }
 
     /** Backward-compatible wrapper — returns only the total, for callers

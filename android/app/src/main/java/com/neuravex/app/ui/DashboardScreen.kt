@@ -1,12 +1,16 @@
 package com.neuravex.app.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Divider
@@ -20,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -31,6 +36,7 @@ import com.neuravex.app.data.DecisionOut
 import com.neuravex.app.data.DailyDecisionStats
 import com.neuravex.app.data.EthereumMainnetBalanceChecker
 import com.neuravex.app.data.PositionOut
+import com.neuravex.app.data.WalletHeldAsset
 import com.neuravex.app.security.SecureCredentialStore
 import com.neuravex.app.service.TradingExecutionService
 import kotlinx.coroutines.delay
@@ -54,6 +60,12 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
     // tucked inside a notification the user has to catch at the right
     // moment.
     var balanceDiagnostics by remember { mutableStateOf<String?>(configStore.lastBalanceDiagnostics) }
+    // Structured, per-token version of the above — see
+    // AppConfigStore.lastHeldAssets. This is what the "Tokens" list below
+    // renders; balanceDiagnostics stays around only as the raw, collapsed
+    // "Details" text for diagnosing a failed/partial check.
+    var heldAssets by remember { mutableStateOf(configStore.lastHeldAssets) }
+    var showBalanceDetails by remember { mutableStateOf(false) }
     // Fetched alongside `overview` on the same poll cycle, purely to show
     // whether what's on screen is simulated or real — see the badge in
     // the header below. Nothing else on this screen currently branches on
@@ -77,6 +89,10 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
     // EthereumMainnetBalanceChecker's class doc for why this is kept
     // completely separate from the Polygon side.
     var otherNetworkBalances by remember { mutableStateOf<Map<String, java.math.BigDecimal>>(emptyMap()) }
+    // Same holdings as otherNetworkBalances above, but already priced and
+    // in the shared WalletHeldAsset shape — feeds the unified "Tokens"
+    // list below alongside the Polygon side (heldAssets).
+    var otherNetworkAssets by remember { mutableStateOf<List<WalletHeldAsset>>(emptyList()) }
     // USD value of the above, folded into the "Portfolio" headline figure
     // so it matches what a wallet app shows across every network — see
     // EthereumMainnetBalanceChecker.getTotalUsd(). `otherNetworksComplete`
@@ -133,6 +149,7 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                 // Keep showing the last known rate rather than blanking it.
             }
             balanceDiagnostics = configStore.lastBalanceDiagnostics
+            heldAssets = configStore.lastHeldAssets
             delay(15_000)
         }
     }
@@ -151,6 +168,7 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                     val valueResult = checker.getTotalUsd()
                     otherNetworksUsd = valueResult.totalUsd
                     otherNetworksComplete = valueResult.complete
+                    otherNetworkAssets = valueResult.heldAssets
                 } catch (e: Exception) {
                     // View-only — a failed check here just means this
                     // section stays empty/stale for one cycle, never an
@@ -239,19 +257,43 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
             }
         }
 
-        // Persistent, always-visible diagnostic for the wallet-balance
-        // check — see AppConfigStore.lastBalanceDiagnostics for why this
-        // is here instead of only in the (easy-to-miss) notification.
-        balanceDiagnostics?.let { diag ->
-            item {
-                Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
-                    androidx.compose.foundation.layout.Column(
-                        modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text("Last wallet balance check", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
-                        diag.split("\n").forEach { line ->
-                            Text(line, color = NeuravexColors.Silver, style = MaterialTheme.typography.bodySmall)
+        // Unified "Tokens" list — everything actually held, across both
+        // networks NEURAVEX can read (Polygon, traded; Ethereum mainnet,
+        // view-only — see WalletHeldAsset's doc in Models.kt), rendered
+        // the way a wallet app like MetaMask shows what you own: one row
+        // per token, icon + name, value + quantity. Replaces the old raw
+        // diagnostic-text dump, which is still available (unabridged, for
+        // debugging a failed/partial check) behind the "Show details"
+        // toggle below.
+        run {
+            val allTokens = (heldAssets + otherNetworkAssets).sortedByDescending { it.usdValue }
+            item { Text("Tokens", style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver) }
+            if (allTokens.isEmpty()) {
+                item { Text("No tokens found in the last wallet check yet.", color = NeuravexColors.SilverDim) }
+            } else {
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
+                        androidx.compose.foundation.layout.Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                            allTokens.forEachIndexed { index, asset ->
+                                TokenRow(asset)
+                                if (index != allTokens.lastIndex) Divider()
+                            }
+                        }
+                    }
+                }
+            }
+            balanceDiagnostics?.let { diag ->
+                item {
+                    androidx.compose.foundation.layout.Column {
+                        TextButton(onClick = { showBalanceDetails = !showBalanceDetails }) {
+                            Text(if (showBalanceDetails) "Hide balance-check details" else "Show balance-check details")
+                        }
+                        if (showBalanceDetails) {
+                            androidx.compose.foundation.layout.Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                diag.split("\n").forEach { line ->
+                                    Text(line, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
                         }
                     }
                 }
@@ -259,27 +301,6 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
         }
 
         item { Divider() }
-
-        // View-only Ethereum-mainnet holdings — NEVER traded by
-        // NEURAVEX, shown purely so "what do I own" matches what MetaMask
-        // shows across every network, not just Polygon.
-        if (otherNetworkBalances.isNotEmpty()) {
-            item {
-                Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
-                    androidx.compose.foundation.layout.Column(
-                        modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text("Other networks (view only — not traded)", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
-                        Text("Ethereum mainnet", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
-                        otherNetworkBalances.forEach { (symbol, amount) ->
-                            Text("$symbol: $amount", color = NeuravexColors.Silver, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
-            }
-            item { Divider() }
-        }
 
         item { Text("Open positions", style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver) }
         if (positions.isEmpty()) {
@@ -378,4 +399,45 @@ private fun StatCard(label: String, value: String, valueColor: androidx.compose.
             Text(value, color = valueColor, style = MaterialTheme.typography.headlineSmall)
         }
     }
+}
+
+/** One row in the "Tokens" list — icon, symbol + network, value + quantity.
+ * The icon has no real per-token logo (NEURAVEX has never needed one
+ * before this), so it's a plain monogram circle; good enough to scan a
+ * list at a glance, the same job a logo does here. */
+@Composable
+private fun TokenRow(asset: WalletHeldAsset) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(
+                modifier = Modifier.size(36.dp).background(NeuravexColors.VioletGlow, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    asset.symbol.take(1).uppercase(),
+                    color = NeuravexColors.Silver,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            androidx.compose.foundation.layout.Column {
+                Text(asset.symbol, color = NeuravexColors.Silver, style = MaterialTheme.typography.bodyLarge)
+                Text(asset.network, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        androidx.compose.foundation.layout.Column(horizontalAlignment = Alignment.End) {
+            Text("$%.2f".format(asset.usdValue), color = NeuravexColors.Silver, style = MaterialTheme.typography.bodyLarge)
+            Text(formatTokenQuantity(asset.quantity), color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+/** Up to 6 decimals, trailing zeros trimmed — e.g. 124.14284926491537
+ * shows as "124.142849", and a whole number like 5.0 shows as "5". */
+private fun formatTokenQuantity(quantity: Double): String {
+    val formatted = "%.6f".format(quantity).trimEnd('0').trimEnd('.')
+    return formatted.ifEmpty { "0" }
 }

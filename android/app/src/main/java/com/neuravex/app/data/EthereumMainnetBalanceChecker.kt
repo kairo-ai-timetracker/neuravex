@@ -69,9 +69,17 @@ class EthereumMainnetBalanceChecker(privateKeyHex: String) {
     /**
      * Value of everything on Ethereum mainnet in USD. `complete` is true
      * only if every balance lookup succeeded AND every non-zero balance
-     * could be priced.
+     * could be priced. `heldAssets` is the same WalletHeldAsset shape
+     * PolygonDexExecutionClient produces (see its doc / Models.kt) —
+     * purely for the Dashboard's on-screen "Tokens" list, never sent
+     * anywhere.
      */
-    data class ValueResult(val totalUsd: Double, val complete: Boolean, val diagnostics: List<String>)
+    data class ValueResult(
+        val totalUsd: Double,
+        val complete: Boolean,
+        val diagnostics: List<String>,
+        val heldAssets: List<WalletHeldAsset> = emptyList(),
+    )
 
     suspend fun getTotalUsd(): ValueResult {
         val checked = getBalancesChecked()
@@ -79,6 +87,7 @@ class EthereumMainnetBalanceChecker(privateKeyHex: String) {
         val prices = if (held.isEmpty()) emptyMap() else UsdPriceLookup.getUsdPrices(held.keys)
         var total = 0.0
         val diagnostics = mutableListOf<String>()
+        val heldAssets = mutableListOf<WalletHeldAsset>()
         var complete = checked.failed.isEmpty()
         for ((symbol, amount) in checked.balances) {
             if (amount.signum() <= 0) {
@@ -93,10 +102,11 @@ class EthereumMainnetBalanceChecker(privateKeyHex: String) {
                 val usd = amount.toDouble() * price
                 total += usd
                 diagnostics += "Ethereum $symbol: $amount -> \$%.6f".format(usd)
+                heldAssets += WalletHeldAsset(symbol, "Ethereum", amount.toDouble(), usd)
             }
         }
         checked.failed.forEach { diagnostics += "Ethereum $it: balance lookup FAILED" }
-        return ValueResult(total, complete, diagnostics)
+        return ValueResult(total, complete, diagnostics, heldAssets)
     }
 
     suspend fun getBalancesChecked(): CheckedBalances = withContext(Dispatchers.IO) {
