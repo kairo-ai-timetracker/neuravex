@@ -285,13 +285,21 @@ def report_balance(
     instead of the account's fixed `starting_balance` placeholder, with no
     further change needed on the read side.
     """
-    previous = (
-        db.query(m.PortfolioSnapshot)
+    # BUG FIX (was comparing only against the single most-recent snapshot,
+    # so drawdown collapsed toward 0% the moment equity ticked up even
+    # slightly, regardless of how far below the account's true all-time
+    # high it still was). The account-wide circuit breaker
+    # (trading_engine/risk/risk_engine.py's check_account_wide_limits, fed
+    # by SqlDataStore.get_portfolio_state) computes peak_equity as the max
+    # equity ever recorded across ALL snapshots — this must match that
+    # exactly, or the dashboard's displayed drawdown silently disagrees
+    # with the number that's actually halting trading.
+    historical_peak_equity = (
+        db.query(func.max(m.PortfolioSnapshot.equity))
         .filter_by(account_id=account_id, is_simulated=False)
-        .order_by(desc(m.PortfolioSnapshot.taken_at))
-        .first()
+        .scalar()
     )
-    peak_equity = max(req.equity, previous.equity) if previous else req.equity
+    peak_equity = max(req.equity, historical_peak_equity) if historical_peak_equity else req.equity
     drawdown = (peak_equity - req.equity) / peak_equity if peak_equity else 0.0
 
     snapshot = m.PortfolioSnapshot(
