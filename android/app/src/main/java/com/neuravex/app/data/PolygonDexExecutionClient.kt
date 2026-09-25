@@ -442,6 +442,31 @@ class PolygonDexExecutionClient(
             diagnostics += "USDC: lookup FAILED — ${e.javaClass.simpleName}: ${e.message}"
         }
 
+        // Bridged USDC.e (see PolygonTokenRegistry.USDC_BRIDGED's doc) —
+        // counted into `total` and `heldAssets` (so Portfolio and the
+        // Tokens list agree, and both match a wallet app's total) but
+        // deliberately NEVER added to `assets`: that list is what the
+        // backend adopts as a tradable position, and USDC.e has no
+        // PolygonTokenRegistry/BUILT_IN entry to trade against — same
+        // reasoning as native MATIC's exclusion above.
+        try {
+            val usdcBridgedBalance = erc20BalanceOf(PolygonTokenRegistry.USDC_BRIDGED.address)
+            val usdValue = fromRawAmount(usdcBridgedBalance, PolygonTokenRegistry.USDC_BRIDGED.decimals)
+            if (usdValue > BigDecimal.ZERO) {
+                total = total.add(usdValue)
+                diagnostics += "USDC.e (bridged): \$$usdValue"
+                heldAssets += WalletHeldAsset(
+                    "USDC.e", "Polygon",
+                    fromRawAmount(usdcBridgedBalance, PolygonTokenRegistry.USDC_BRIDGED.decimals).toDouble(),
+                    usdValue.toDouble(),
+                )
+            } else {
+                diagnostics += "USDC.e (bridged): zero balance, skipped"
+            }
+        } catch (e: Exception) {
+            diagnostics += "USDC.e (bridged): lookup FAILED — ${e.javaClass.simpleName}: ${e.message}"
+        }
+
         PortfolioValueResult(totalUsdc = total.toDouble(), diagnostics = diagnostics, assets = assets, heldAssets = heldAssets)
     }
 

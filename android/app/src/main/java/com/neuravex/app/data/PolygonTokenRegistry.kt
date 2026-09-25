@@ -38,6 +38,21 @@ object PolygonTokenRegistry {
     // different address.
     val USDC = Token("USDC", "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6)
 
+    // The older, PoS-bridged USDC ("USDC.e") — a separate contract from
+    // native USDC above, from before Circle issued USDC directly on
+    // Polygon. Verified against PolygonScan's own token page and Circle's
+    // migration announcement (circle.com/blog/what-you-need-to-know-
+    // native-usdc-on-polygon-pos), which lists both addresses side by
+    // side. Deliberately NOT added to BUILT_IN/ALL below: this exists
+    // purely so PolygonDexExecutionClient can read the balance for the
+    // wallet's "Tokens" display (so it matches what a wallet app like
+    // MetaMask shows), not to make it a second tradable "USDC-like"
+    // symbol — NEURAVEX's cost basis, positions and P/L are all tracked
+    // against the ONE quote currency (native USDC) already wired through
+    // every strategy/risk calculation, and a second one would only
+    // confuse that, never help it.
+    val USDC_BRIDGED = Token("USDC.e", "0x2791bca1f2de4661ED88A30C99A7a9449Aa84174", 6)
+
     // (PoS-bridged) USDT — verified directly against its own PolygonScan
     // token page.
     val USDT = Token("USDT", "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", 6)
