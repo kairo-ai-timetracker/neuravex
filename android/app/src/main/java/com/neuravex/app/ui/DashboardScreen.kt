@@ -149,7 +149,37 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                 // Keep showing the last known rate rather than blanking it.
             }
             balanceDiagnostics = configStore.lastBalanceDiagnostics
-            heldAssets = configStore.lastHeldAssets
+            // BUG FIX: TradingExecutionService deliberately clears
+            // configStore.lastHeldAssets in simulation mode (there is no
+            // real wallet to check), which left the "Tokens" list below
+            // permanently empty while simulating — the ONLY place that
+            // still showed simulated holdings was the separate "Open
+            // positions" card, in a plain qty@price format, not the
+            // Tokens list the user actually wanted. Simulation already has
+            // everything needed to fill that list itself: `positions`
+            // (fetched above) is dashboard.py's own synthesized view of
+            // AccountSettings.paper_balances/paper_positions — the exact
+            // same data "Open positions" already reads — reshaped here
+            // into the shared WalletHeldAsset rows, plus the simulated
+            // USDC cash itself (a real wallet's Tokens list always
+            // includes its USDC row too; the simulated one was simply
+            // missing it).
+            heldAssets = if (paperTradingEnabled) {
+                val simulatedTokens = positions.map { p ->
+                    WalletHeldAsset(
+                        symbol = p.symbol.substringBefore("/"), network = "Simulatie",
+                        quantity = p.quantity, usdValue = p.quantity * p.entry_price,
+                    )
+                }
+                val simulatedCash = overview?.cash ?: 0.0
+                if (simulatedCash > 0.0) {
+                    simulatedTokens + WalletHeldAsset("USDC", "Simulatie", simulatedCash, simulatedCash)
+                } else {
+                    simulatedTokens
+                }
+            } else {
+                configStore.lastHeldAssets
+            }
             delay(15_000)
         }
     }
@@ -221,7 +251,18 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
             // See `executionVenue`'s comment above: don't add Ethereum a
             // second time when the backend's own `equity` already
             // includes it.
-            val backendAlreadyIncludesOtherNetworks = executionVenue == "wallet" && !paperTradingEnabled
+            //
+            // BUG FIX: this used to read `executionVenue == "wallet" &&
+            // !paperTradingEnabled` — true only for LIVE wallet accounts —
+            // which meant a SIMULATION account (paperTradingEnabled=true)
+            // always fell through to the `else` branch and added the
+            // REAL Ethereum-mainnet wallet's value on top of the fictional
+            // simulated equity. "SIMULATION — no real funds" was sitting
+            // right above a number that silently included real funds.
+            // Simulation should never mix in anything real, regardless of
+            // venue, so it's excluded outright below.
+            val backendAlreadyIncludesOtherNetworks =
+                paperTradingEnabled || (executionVenue == "wallet" && !paperTradingEnabled)
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     val portfolioUsd = ov.equity + (if (backendAlreadyIncludesOtherNetworks) 0.0 else otherNetworksUsd)
@@ -266,7 +307,11 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
         // debugging a failed/partial check) behind the "Show details"
         // toggle below.
         run {
-            val allTokens = (heldAssets + otherNetworkAssets).sortedByDescending { it.usdValue }
+            // Same reasoning as the Portfolio fix above: a real Ethereum-
+            // mainnet holding has no business in a simulation's Tokens
+            // list, which should show only the fictional positions above.
+            val allTokens = (heldAssets + (if (paperTradingEnabled) emptyList() else otherNetworkAssets))
+                .sortedByDescending { it.usdValue }
             item { Text("Tokens", style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver) }
             if (allTokens.isEmpty()) {
                 item { Text("No tokens found in the last wallet check yet.", color = NeuravexColors.SilverDim) }
