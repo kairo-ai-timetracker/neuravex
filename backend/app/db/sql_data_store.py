@@ -8,7 +8,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from backend.app.models import models as m
@@ -223,22 +223,35 @@ class SqlDataStore:
         )
         self.session.add(row)
 
-    def has_pending_close(self, account_id: str, symbol: str) -> bool:
+    def has_pending_order(self, account_id: str, symbol: str, side: str) -> bool:
         """
-        True if a sell for this symbol has already been proposed and isn't
-        resolved yet — either still waiting for the phone to pick it up
-        (status="pending") or already claimed by it but not yet reported
-        back as executed/failed (status="claimed"). Both count: the
-        window between claim and report can easily span a full
-        run_agent_tick cycle (a real on-chain confirmation + the phone
-        calling back /api/execution/{id}/report takes real time), and a
-        second close queued during that window is just as much a
-        duplicate as one queued while the first is still "pending".
-        Mirrors the identical guard tasks.py's check_live_exits already
-        uses for its own take-profit/stop-loss sweep (see its
-        `already_pending` check) — this gives agent.py's AI-judged close
-        path (trading_engine/agent.py's _process_symbol) the same
-        protection, which it was missing entirely.
+        True if an order of this SIDE ("buy" or "sell") for this symbol has
+        already been proposed and isn't resolved yet — either still waiting
+        for the phone to pick it up (status="pending") or already claimed
+        by it but not yet reported back as executed/failed
+        (status="claimed"). Both count: the window between claim and
+        report can easily span a full run_agent_tick cycle (a real
+        on-chain confirmation + the phone calling back
+        /api/execution/{id}/report takes real time), and a second order
+        queued during that window is just as much a duplicate as one
+        queued while the first is still "pending".
+
+        Originally this only covered sells (as has_pending_close, called
+        from agent.py's AI-judged close path — see tasks.py's
+        check_live_exits for the near-identical guard that inspired it).
+        It was widened to take `side` after the exact same failure mode
+        showed up on the BUY side in production: WMATIC/USDC and AAVE/USDC
+        each got several duplicate "buy" PendingExecution rows queued one
+        per tick (2026-09-25 ~04:34-04:36) while the first buy for that
+        symbol was still in flight — one succeeded, the rest failed
+        on-chain with "Insufficient USDC" once the first had already spent
+        it. The BUY path's only other protection (check_trade_against_
+        limits' "symbol already in open_positions" check, risk_engine.py)
+        only looks at CONFIRMED positions, not orders still in flight, so
+        it does nothing during that gap — exactly the same structural hole
+        the close path had. Call this for both sides: agent.py's
+        _process_symbol calls it with side="sell" from the close branch
+        and side="buy" right before risk-checking a new entry.
 
         A "pending" row additionally has to still be UNCLAIMED WITHIN ITS
         WINDOW to count — see expire_stale_pending_executions' docstring
@@ -246,15 +259,15 @@ class SqlDataStore:
         looked like in its first version, and what check_live_exits' own
         already_pending check still does) can get permanently stuck true
         forever for a row the phone never claimed in time, silently
-        blocking every future close attempt for that symbol. A "claimed"
-        row has no such window to check — claim_execution() (execution.py)
+        blocking every future order for that symbol/side. A "claimed" row
+        has no such window to check — claim_execution() (execution.py)
         already refuses to claim anything past its expires_at, so every
         claimed row was, by construction, claimed in time.
         """
         now = datetime.utcnow()
         return (
             self.session.query(m.PendingExecution)
-            .filter_by(account_id=account_id, symbol=symbol, side=m.OrderSide.sell)
+            .filter_by(account_id=account_id, symbol=symbol, side=m.OrderSide(side))
             .filter(
                 or_(
                     m.PendingExecution.status == "claimed",
@@ -328,21 +341,125 @@ class SqlDataStore:
             default=equity,
         )
 
-        open_positions_rows = (
-            self.session.query(m.Position)
-            .filter_by(account_id=account_id, status=m.PositionStatus.open)
-            .all()
-        )
-        # quantity/entry_price (not just notional) are needed by agent.py to
-        # close a position on the AI's own sell signal — a full close sells
-        # the exact held quantity, not a freshly risk-sized amount, so the
-        # closing path needs the real quantity available here.
-        open_positions = {
-            p.symbol: {"notional": p.quantity * p.entry_price, "quantity": p.quantity, "entry_price": p.entry_price}
-            for p in open_positions_rows
-        }
+        # BUG FIX: trades_this_hour / last_entry_time / last_signal_time_by_
+        # symbol were never populated — every call returned the dataclass
+        # defaults (0 / None / {}), so check_trade_against_limits'
+        # cooldown_seconds, max_trades_per_hour and min_time_between_entries
+        # checks (risk_engine.py) never actually fired: not "rarely
+        # triggered", literally dead code, every single tick, live and
+        # simulated alike. Same reasoning as this method's open_positions
+        # below: simulation and live keep their history in different
+        # places, so each needs its own source for these.
+        now = datetime.utcnow()
+        one_hour_ago = now - timedelta(hours=1)
+
+        if self.simulated:
+            # No Position row is ever written for a simulated trade (see
+            # open_positions below) — the only timestamped record that a
+            # simulated buy/sell actually happened is AIDecision.executed.
+            # That flag is trustworthy here in a way it is NOT on the live
+            # side: tasks.py's paper-trading branch fills synchronously,
+            # server-side, in the same tick that saves the decision
+            # (execution_mode="server"), so executed=True already means
+            # "filled", not "handed to the phone and maybe never
+            # confirmed" the way it does for a live, phone-queued order.
+            executed_trade_filter = and_(
+                m.AIDecision.account_id == account_id,
+                m.AIDecision.executed.is_(True),
+                m.AIDecision.action.in_([m.DecisionAction.buy, m.DecisionAction.sell]),
+            )
+            trades_this_hour = (
+                self.session.query(func.count(m.AIDecision.id))
+                .filter(executed_trade_filter, m.AIDecision.created_at >= one_hour_ago)
+                .scalar()
+            ) or 0
+            last_entry_time = (
+                self.session.query(func.max(m.AIDecision.created_at))
+                .filter(executed_trade_filter, m.AIDecision.action == m.DecisionAction.buy)
+                .scalar()
+            )
+            last_signal_time_by_symbol = dict(
+                self.session.query(m.AIDecision.symbol, func.max(m.AIDecision.created_at))
+                .filter(executed_trade_filter)
+                .group_by(m.AIDecision.symbol)
+                .all()
+            )
+
+            # Simulated positions live in AccountSettings.paper_balances /
+            # paper_positions (see dashboard.py's get_positions for the
+            # identical reasoning) — never in the `positions` table, which
+            # is live-only. Without this, every check below (duplicate-
+            # symbol, max_open_positions, correlation/exposure) was
+            # silently evaluated against the account's LIVE positions
+            # instead — usually empty, which let simulation open
+            # unlimited duplicate/correlated positions no live account
+            # ever could.
+            settings_row = self.session.query(m.AccountSettings).filter_by(account_id=account_id).first()
+            paper_balances = settings_row.paper_balances if settings_row else {}
+            paper_positions = settings_row.paper_positions if settings_row else {}
+            open_positions = {
+                f"{asset}/USDC": {
+                    "notional": qty * paper_positions.get(asset, 0.0),
+                    "quantity": qty,
+                    "entry_price": paper_positions.get(asset, 0.0),
+                }
+                for asset, qty in paper_balances.items()
+                if asset != "USDC" and qty > 0
+            }
+        else:
+            trades_this_hour = (
+                self.session.query(func.count(m.Position.id))
+                .filter(m.Position.account_id == account_id, m.Position.opened_at >= one_hour_ago)
+                .scalar()
+            ) or 0
+            last_entry_time = (
+                self.session.query(func.max(m.Position.opened_at))
+                .filter(m.Position.account_id == account_id)
+                .scalar()
+            )
+            # A symbol's cooldown should restart on EITHER a fresh entry
+            # or a close (selling and immediately re-buying the same
+            # symbol is exactly the flip-flopping cooldown_seconds exists
+            # to prevent) — so both opened_at and closed_at count, merged
+            # per symbol in Python since they come from two separate
+            # aggregate queries.
+            opened_rows = (
+                self.session.query(m.Position.symbol, func.max(m.Position.opened_at))
+                .filter(m.Position.account_id == account_id)
+                .group_by(m.Position.symbol)
+                .all()
+            )
+            closed_rows = (
+                self.session.query(m.Position.symbol, func.max(m.Position.closed_at))
+                .filter(m.Position.account_id == account_id, m.Position.closed_at.isnot(None))
+                .group_by(m.Position.symbol)
+                .all()
+            )
+            last_signal_time_by_symbol: dict[str, datetime] = {}
+            for symbol, ts in [*opened_rows, *closed_rows]:
+                if ts is None:
+                    continue
+                existing = last_signal_time_by_symbol.get(symbol)
+                if existing is None or ts > existing:
+                    last_signal_time_by_symbol[symbol] = ts
+
+            open_positions_rows = (
+                self.session.query(m.Position)
+                .filter_by(account_id=account_id, status=m.PositionStatus.open)
+                .all()
+            )
+            # quantity/entry_price (not just notional) are needed by agent.py to
+            # close a position on the AI's own sell signal — a full close sells
+            # the exact held quantity, not a freshly risk-sized amount, so the
+            # closing path needs the real quantity available here.
+            open_positions = {
+                p.symbol: {"notional": p.quantity * p.entry_price, "quantity": p.quantity, "entry_price": p.entry_price}
+                for p in open_positions_rows
+            }
 
         return PortfolioState(
             equity=equity, peak_equity=peak_equity, cash=equity, open_positions=open_positions,
             daily_pnl=0.0, daily_start_equity=equity,
+            trades_this_hour=trades_this_hour, last_entry_time=last_entry_time,
+            last_signal_time_by_symbol=last_signal_time_by_symbol,
         )
