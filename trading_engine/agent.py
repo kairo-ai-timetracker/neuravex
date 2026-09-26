@@ -53,7 +53,7 @@ class DataStore(Protocol):
     def save_risk_event(self, event_type: str, severity: str, message: str, context: dict) -> None: ...
     def save_pending_execution(self, account_id: str, decision_id: str | None, plan: PlannedOrder) -> None: ...
     def get_portfolio_state(self, account_id: str) -> PortfolioState: ...
-    def has_pending_close(self, account_id: str, symbol: str) -> bool: ...
+    def has_pending_order(self, account_id: str, symbol: str, side: str) -> bool: ...
 
 
 @dataclass
@@ -237,7 +237,7 @@ class NeuravexAgent:
             # check_live_exits already guards its own sweep this exact way
             # (see tasks.py) — this mirrors that same guard for the AI's own
             # signal-driven close, which was missing it entirely.
-            if self.store.has_pending_close(self.account_id, symbol):
+            if self.store.has_pending_order(self.account_id, symbol, "sell"):
                 decision.action = "NO_TRADE"
                 decision.reasons_against.append(
                     "A close for this position is already in flight (proposed but not yet "
@@ -248,7 +248,7 @@ class NeuravexAgent:
                 f"AI-judged exit: closing full {symbol} position ({held_quantity:.6f}) on its own "
                 f"signal, not a fixed profit/loss threshold"
             )
-            return await self._close_position(symbol, held_quantity, decision)
+            return await self._close_position(symbol, held_quantity, decision, state)
 
         entry = float(data.close[-1])
         atr_value = float(atr(data.high, data.low, data.close)[-1])
@@ -260,6 +260,25 @@ class NeuravexAgent:
             decision.action = "NO_TRADE"
             decision.reasons_against.append(
                 "SHORT signal ignored: spot-only account cannot open a short without holding the asset"
+            )
+            return decision
+
+        # Same structural gap as the close path (see has_pending_order's
+        # docstring), just on the BUY side: check_trade_against_limits
+        # below only rejects a symbol that's already a CONFIRMED open
+        # position — it has no idea about a buy that's already been
+        # proposed to the phone but not yet executed/reported. Without
+        # this, the exact same LONG signal firing again next tick (before
+        # the first buy's fill comes back) queues a second, overlapping
+        # buy for the same symbol — confirmed live on 2026-09-25 for both
+        # WMATIC/USDC and AAVE/USDC: one buy went through, several more
+        # queued in the following minutes each failed on-chain with
+        # "Insufficient USDC" once the first had already spent it.
+        if self.store.has_pending_order(self.account_id, symbol, "buy"):
+            decision.action = "NO_TRADE"
+            decision.reasons_against.append(
+                "A buy for this symbol is already in flight (proposed but not yet "
+                "executed/reported) — skipping to avoid a duplicate overlapping purchase"
             )
             return decision
 
@@ -332,6 +351,7 @@ class NeuravexAgent:
             )
             self.store.save_pending_execution(self.account_id, decision_id, planned)
             decision.executed = True
+            self._reserve_entry_in_state(state, symbol, size.quantity, entry)
             return decision
 
         assert_live_order_allowed(
@@ -342,9 +362,10 @@ class NeuravexAgent:
         order_result = await self.exchange.create_order(symbol, side, OrderType.market, size.quantity)
         self.store.save_order_result(order_result, decision_id, self.account_id)
         decision.executed = True
+        self._reserve_entry_in_state(state, symbol, size.quantity, entry)
         return decision
 
-    async def _close_position(self, symbol: str, quantity: float, decision: Decision) -> Decision:
+    async def _close_position(self, symbol: str, quantity: float, decision: Decision, state: PortfolioState) -> Decision:
         """
         Closes a held position at the AI's own initiative (called from
         _process_symbol when a SHORT signal lands on a symbol we already
@@ -379,6 +400,7 @@ class NeuravexAgent:
             )
             self.store.save_pending_execution(self.account_id, decision_id, planned)
             decision.executed = True
+            self._release_position_in_state(state, symbol)
             return decision
 
         assert_live_order_allowed(
@@ -388,4 +410,57 @@ class NeuravexAgent:
         order_result = await self.exchange.create_order(symbol, Side.sell, OrderType.market, quantity)
         self.store.save_order_result(order_result, decision_id, self.account_id)
         decision.executed = True
+        self._release_position_in_state(state, symbol)
         return decision
+
+    @staticmethod
+    def _reserve_entry_in_state(state: PortfolioState, symbol: str, quantity: float, entry_price: float) -> None:
+        """
+        BUG FIX: run_tick() fetches `state` ONCE per tick and reuses that
+        same snapshot for every symbol in self.config.symbols — but every
+        check above (duplicate-symbol, max_open_positions, correlation/
+        exposure, cooldown_seconds, max_trades_per_hour,
+        min_time_between_entries_seconds) reads straight off `state`. Without
+        this, if several symbols in the SAME tick all signal a LONG, every
+        one of them sees the SAME stale cash/open-positions/trade-count
+        snapshot from the tick's start and independently concludes "I have
+        room" — confirmed live in simulation on 2026-09-26: 8 symbols in one
+        tick all sized a ~$2512 buy off the same starting equity, only ~2
+        of them actually fit the real cash, and the other 6 blew up with
+        InsufficientBalanceError once the (correctly enforced, real)
+        exchange-level balance check caught what this stale state couldn't.
+        That's the same shape of waste as the WMATIC/AAVE incident this
+        codebase already fixed once (has_pending_order) — just between
+        DIFFERENT symbols sharing one tick's capital instead of the SAME
+        symbol proposed twice across ticks.
+        Called right after decision.executed is set True (both the "phone"
+        and direct-exchange paths) so every symbol processed LATER in this
+        SAME tick sees the commitment this one just made — cheap, in-memory,
+        and self-corrects next tick anyway once get_portfolio_state() re-reads
+        the real, confirmed numbers from the database.
+        """
+        state.open_positions[symbol] = {
+            "notional": quantity * entry_price, "quantity": quantity, "entry_price": entry_price,
+        }
+        state.cash = max(0.0, state.cash - quantity * entry_price)
+        now = datetime.utcnow()
+        state.trades_this_hour += 1
+        state.last_entry_time = now
+        state.last_signal_time_by_symbol[symbol] = now
+
+    @staticmethod
+    def _release_position_in_state(state: PortfolioState, symbol: str) -> None:
+        """
+        Same reasoning as _reserve_entry_in_state, for the close side: a
+        symbol closed earlier in this tick must stop showing up in
+        state.open_positions for any symbol processed later in the same
+        tick (duplicate-symbol / max_open_positions / correlation checks
+        all read that dict directly). Cash is deliberately left untouched
+        here rather than credited back an estimate — in "phone" mode the
+        real fill price isn't known synchronously, and undercounting
+        available cash only makes later same-tick checks more conservative,
+        never less safe, which is the right direction to be wrong in on a
+        live account.
+        """
+        state.open_positions.pop(symbol, None)
+        state.last_signal_time_by_symbol[symbol] = datetime.utcnow()

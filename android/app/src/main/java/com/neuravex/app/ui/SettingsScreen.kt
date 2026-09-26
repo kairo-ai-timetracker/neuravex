@@ -33,6 +33,7 @@ import androidx.fragment.app.FragmentActivity
 import com.neuravex.app.data.AccountSettingsUpdate
 import com.neuravex.app.data.ApiClientFactory
 import com.neuravex.app.data.AppConfigStore
+import com.neuravex.app.data.CurrencyConverter
 import com.neuravex.app.data.SupportedCoins
 import com.neuravex.app.data.SupportedPolygonCoins
 import com.neuravex.app.security.BiometricGate
@@ -72,6 +73,19 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
     var paperTradingEnabled by remember { mutableStateOf(true) }
     var paperStartingBalanceText by remember { mutableStateOf("1000") }
     var paperEquity by remember { mutableStateOf(1000.0) }
+    // BUG FIX: the backend's paper_starting_balance / paper_equity are
+    // USD-equivalent (paper_balances is literally seeded as {"USDC": ...}
+    // — see settings.py) — the exact same "raw dollar number shown with a
+    // € sign" trap CurrencyConverter's own doc describes, which the
+    // Dashboard already avoids for the real wallet (DashboardScreen.kt)
+    // but this screen's simulation fields never did. That's why resetting
+    // the simulation to a typed amount always seemed to "go to a
+    // different number" the moment the Dashboard (which DOES convert)
+    // showed it back: e.g. typing 1000 sent $1000 to the backend, and the
+    // Dashboard then correctly showed ~€877 of it — nothing was wrong on
+    // the backend, the two screens just disagreed about which currency
+    // this field was in. Converted consistently with the Dashboard below.
+    var usdToEurRate by remember { mutableStateOf<Double?>(null) }
     var customSymbolText by remember { mutableStateOf(configStore.customTokenSymbol ?: "") }
     var customAddressText by remember { mutableStateOf(configStore.customTokenAddress ?: "") }
     var customDecimalsText by remember { mutableStateOf(configStore.customTokenDecimals.toString()) }
@@ -115,6 +129,11 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
         if (hasWalletKey) {
             walletAddress = credentialStore.getWalletAddress()
         }
+        // Fetched before the settings response is handled below, so the
+        // USD -> EUR conversion of paper_starting_balance/paper_equity has
+        // a real rate to use the first time this screen renders them.
+        val rate = CurrencyConverter.getUsdToEurRate()
+        usdToEurRate = rate
         try {
             val response = api.getSettings(accountId)
             if (response.isSuccessful) {
@@ -138,8 +157,12 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                     profitTargetText = s.max_balance_target?.let { "%.0f".format(it) } ?: ""
                     aiEnabled = s.ai_enabled
                     paperTradingEnabled = s.paper_trading_enabled
-                    paperStartingBalanceText = "%.0f".format(s.paper_starting_balance)
-                    paperEquity = s.paper_equity
+                    // Both are USD from the backend — see the field
+                    // comment above for why these are converted to EUR
+                    // here, matching how the Dashboard shows this same
+                    // number.
+                    paperStartingBalanceText = "%.0f".format(s.paper_starting_balance * rate)
+                    paperEquity = s.paper_equity * rate
                 }
             } else {
                 statusMessage = "Could not load settings: HTTP ${response.code()}"
@@ -479,14 +502,24 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                         modifier = Modifier.fillMaxWidth(), singleLine = true,
                     )
                     TextButton(onClick = {
-                        val amount = paperStartingBalanceText.toDoubleOrNull()
-                        if (amount == null || amount <= 0) {
+                        val amountEur = paperStartingBalanceText.toDoubleOrNull()
+                        if (amountEur == null || amountEur <= 0) {
                             statusMessage = "Enter a valid amount"
                             return@TextButton
                         }
-                        persist(AccountSettingsUpdate(paper_starting_balance = amount)) { success, error ->
-                            statusMessage = if (success) "Simulation reset to €%.0f".format(amount) else error
-                            if (success) paperEquity = amount
+                        // The field is labeled "(€)" and the user typed a
+                        // euro amount — the backend's paper_starting_balance
+                        // is USD-equivalent (see the field comment above),
+                        // so convert before sending. Without this, a typed
+                        // "1000" (meant as €1000) was stored as $1000 —
+                        // correct on the backend, but a different number
+                        // the instant the Dashboard converted it back to
+                        // euros for display.
+                        val rate = usdToEurRate
+                        val amountUsd = if (rate != null && rate > 0) amountEur / rate else amountEur
+                        persist(AccountSettingsUpdate(paper_starting_balance = amountUsd)) { success, error ->
+                            statusMessage = if (success) "Simulation reset to €%.0f".format(amountEur) else error
+                            if (success) paperEquity = amountEur
                         }
                     }) { Text("Reset simulation to this amount") }
                 }
