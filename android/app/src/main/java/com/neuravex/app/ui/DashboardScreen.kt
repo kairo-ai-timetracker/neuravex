@@ -320,7 +320,7 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                     Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
                         androidx.compose.foundation.layout.Column(modifier = Modifier.padding(vertical = 4.dp)) {
                             allTokens.forEachIndexed { index, asset ->
-                                TokenRow(asset)
+                                TokenRow(asset, usdToEurRate)
                                 if (index != allTokens.lastIndex) Divider()
                             }
                         }
@@ -451,7 +451,7 @@ private fun StatCard(label: String, value: String, valueColor: androidx.compose.
  * before this), so it's a plain monogram circle; good enough to scan a
  * list at a glance, the same job a logo does here. */
 @Composable
-private fun TokenRow(asset: WalletHeldAsset) {
+private fun TokenRow(asset: WalletHeldAsset, eurRate: Double?) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -474,7 +474,15 @@ private fun TokenRow(asset: WalletHeldAsset) {
             }
         }
         androidx.compose.foundation.layout.Column(horizontalAlignment = Alignment.End) {
-            Text("$%.2f".format(asset.usdValue), color = NeuravexColors.Silver, style = MaterialTheme.typography.bodyLarge)
+            // Same USD-equivalent -> EUR conversion as the Portfolio card
+            // above (see CurrencyConverter's doc) — this used to always
+            // show a raw "$" dollar figure here while Portfolio showed the
+            // converted "€" figure, so the same underlying balance looked
+            // like two different amounts depending on which card you read.
+            Text(
+                if (eurRate != null) "€%.2f".format(asset.usdValue * eurRate) else "$%.2f".format(asset.usdValue),
+                color = NeuravexColors.Silver, style = MaterialTheme.typography.bodyLarge,
+            )
             Text(formatTokenQuantity(asset.quantity), color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
         }
     }
