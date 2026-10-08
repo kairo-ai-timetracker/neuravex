@@ -26,8 +26,11 @@ class RecordingStore:
     def save_decision(self, decision, account_id):
         self.decisions.append(decision)
 
-    def save_order_result(self, order_result, decision_id):
+    def save_order_result(self, order_result, decision_id, account_id):
         self.order_results.append(order_result)
+
+    def has_pending_order(self, account_id, symbol, side):
+        return False
 
     def save_risk_event(self, event_type, severity, message, context):
         self.risk_events.append((event_type, severity, message, context))

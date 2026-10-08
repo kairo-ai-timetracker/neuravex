@@ -12,7 +12,7 @@ from typing import Protocol
 
 import numpy as np
 
-from trading_engine.decision_engine import Decision, score_signals
+from trading_engine.decision_engine import Decision, ScoreBreakdown, score_signals
 from trading_engine.execution.exchange_interface import Exchange, OrderType, Side
 from trading_engine.execution.live_guard import assert_live_order_allowed
 from trading_engine.regime.regime_detector import detect_regime
@@ -28,6 +28,12 @@ from trading_engine.signals.indicators import atr
 from trading_engine.strategies.base import OHLCV, Strategy
 
 logger = logging.getLogger("neuravex.agent")
+
+# Tag carried by every Decision/PendingExecution produced by
+# flatten_all_positions for an automatic account-wide circuit breaker
+# (min_balance_floor / max_drawdown), so those closes are distinguishable
+# in trade/decision history from an ordinary strategy-driven sell.
+RISK_CIRCUIT_BREAKER_REASON = "risk_circuit_breaker"
 
 
 @dataclass
@@ -129,7 +135,31 @@ class NeuravexAgent:
             )
         except RiskLimitBreach as e:
             logger.warning("Account-wide risk limit breached: %s", e)
-            self.store.save_risk_event("risk_limit_breach", "critical", str(e), {"account_id": self.account_id})
+            self.store.save_risk_event(
+                "risk_limit_breach", "critical", str(e),
+                {"account_id": self.account_id, "limit": e.limit, "should_flatten": e.should_flatten},
+            )
+            # max_daily_loss only pauses new entries (should_flatten=False);
+            # min_balance_floor / max_drawdown are hard stops that must also
+            # close what's already open, otherwise those positions keep
+            # marking to market and equity keeps sliding past the limit.
+            # Runs again every tick while the breach persists — a no-op once
+            # nothing is left open, and a close already in flight is skipped
+            # (see flatten_all_positions), so a phone-queued sell that was
+            # never claimed gets re-queued after it expires.
+            #
+            # ignore_dry_run=True: this is a protective stop, not an AI
+            # trading decision, so it executes even with AI trading switched
+            # off (including after the kill switch) — the same way
+            # tasks.py's check_live_exits hard stop-loss already runs
+            # regardless of ai_enabled. Otherwise a floor hit while AI is
+            # off would leave every open position bleeding past it.
+            if e.should_flatten:
+                decisions.extend(
+                    await self.flatten_all_positions(
+                        state, RISK_CIRCUIT_BREAKER_REASON, detail=str(e), ignore_dry_run=True,
+                    )
+                )
             return decisions
 
         for symbol in self.config.symbols:
@@ -365,16 +395,86 @@ class NeuravexAgent:
         self._reserve_entry_in_state(state, symbol, size.quantity, entry)
         return decision
 
-    async def _close_position(self, symbol: str, quantity: float, decision: Decision, state: PortfolioState) -> Decision:
+    async def flatten_all_positions(
+        self, state: PortfolioState, reason: str, *, detail: str = "", ignore_dry_run: bool = False,
+    ) -> list[Decision]:
         """
-        Closes a held position at the AI's own initiative (called from
+        Closes EVERY position in state.open_positions — the "flatten" half
+        of an account-wide circuit breaker (run_tick, on a RiskLimitBreach
+        with should_flatten=True) and of the manual close-all endpoint
+        (backend/app/api/emergency.py, via tasks.close_all_positions_for_account).
+
+        state.open_positions already comes from SqlDataStore.get_portfolio_
+        state, which reads simulation positions from AccountSettings.
+        paper_balances/paper_positions and live ones from the `positions`
+        table — so this works for both without re-deriving either. Each
+        close goes through the same _close_position path as an AI-judged
+        sell, so phone hand-off vs. direct order (and the paper exchange
+        for simulation) are handled exactly as for any other sell.
+
+        Deliberately runs NO risk check: this only ever reduces exposure,
+        and must never be vetoed by the very breach it is resolving
+        (check_account_wide_limits / check_trade_against_limits are not
+        called anywhere on this path).
+
+        ignore_dry_run: both callers (the circuit breaker in run_tick and
+        the manual close-all button) pass True — closing exposure is a
+        protective action that must happen even with AI trading switched
+        off. Left False only gives the plain dry-run "would close" logging.
+
+        One failed close must not block the others — each is isolated and
+        a failure is logged as a risk event and skipped.
+        """
+        decisions: list[Decision] = []
+        for symbol, position in list(state.open_positions.items()):
+            quantity = position.get("quantity", 0.0)
+            if quantity <= 0:
+                continue
+            # Same duplicate guard as the AI-judged close path: in phone
+            # mode a sell queued on an earlier tick may not have been
+            # claimed/reported yet, and the position is still "open" until
+            # it is. Don't stack a second full-quantity sell on top of it.
+            if self.store.has_pending_order(self.account_id, symbol, "sell"):
+                logger.info("Flatten (%s): close for %s already in flight — skipping", reason, symbol)
+                continue
+            decision = Decision(
+                symbol=symbol, action="SELL", direction="SHORT", confidence=1.0,
+                score=ScoreBreakdown(
+                    technical_score=0.0, momentum_score=0.0, regime_score=0.0, volume_score=0.0,
+                    strategy_performance_score=0.0, volatility_penalty=0.0, correlation_penalty=0.0,
+                    transaction_cost_penalty=0.0, final_score=0.0,
+                ),
+                reasons_for=[
+                    f"[{reason}] Closing full {symbol} position ({quantity:.6f}) — not a strategy signal"
+                    + (f": {detail}" if detail else "")
+                ],
+            )
+            try:
+                await self._close_position(symbol, quantity, decision, state, ignore_dry_run=ignore_dry_run)
+            except Exception as e:  # noqa: BLE001 — one failed close must not block the others
+                logger.exception("Flatten (%s): closing %s failed: %s", reason, symbol, e)
+                decision.reasons_against.append(f"Close failed: {e}")
+                self.store.save_risk_event(
+                    "flatten_close_failed", "critical", f"{symbol}: {e}",
+                    {"account_id": self.account_id, "symbol": symbol, "reason": reason},
+                )
+            self.store.save_decision(decision, self.account_id)
+            decisions.append(decision)
+        return decisions
+
+    async def _close_position(
+        self, symbol: str, quantity: float, decision: Decision, state: PortfolioState,
+        *, ignore_dry_run: bool = False,
+    ) -> Decision:
+        """
+        Closes a held position — at the AI's own initiative (called from
         _process_symbol when a SHORT signal lands on a symbol we already
-        hold). Mirrors the two execution paths BUY/entry already uses
-        (phone hand-off vs. direct order) but always sells the FULL held
-        quantity — there is no position-sizing step here, since sizing is
-        a new-entry concept and this is an exit.
+        hold) or from flatten_all_positions. Mirrors the two execution
+        paths BUY/entry already uses (phone hand-off vs. direct order) but
+        always sells the FULL held quantity — there is no position-sizing
+        step here, since sizing is a new-entry concept and this is an exit.
         """
-        if self.config.dry_run:
+        if self.config.dry_run and not ignore_dry_run:
             decision.reasons_for.append(
                 f"Would SELL (close) {quantity:.6f} {symbol} — AI trading is currently off, nothing was executed"
             )

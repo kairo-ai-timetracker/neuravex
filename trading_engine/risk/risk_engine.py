@@ -36,7 +36,21 @@ class RiskCheckResult:
 class RiskLimitBreach(Exception):
     """Raised for account-wide breaches that should halt all new trading,
     not just reject a single trade (max_drawdown, max_daily_loss, or the
-    user's own min_balance_floor)."""
+    user's own min_balance_floor).
+
+    should_flatten distinguishes the two severities: True means "close
+    every open position AND halt" (min_balance_floor, max_drawdown — a
+    hard stop, where letting already-open positions keep marking to
+    market would let equity keep sliding past the limit); False means
+    "only stop opening new trades" (max_daily_loss — a temporary pause
+    until the next trading day, not a liquidation event). `limit` names
+    which check fired, for logs/risk events.
+    """
+
+    def __init__(self, message: str, *, should_flatten: bool, limit: str):
+        super().__init__(message)
+        self.should_flatten = should_flatten
+        self.limit = limit
 
 
 def check_account_wide_limits(
@@ -46,7 +60,9 @@ def check_account_wide_limits(
     min_balance_floor: float | None = None,
 ) -> None:
     """Call this before evaluating ANY new trade. Raises if the account is
-    in a state where no new trades should be opened at all.
+    in a state where no new trades should be opened at all — and, via
+    RiskLimitBreach.should_flatten, whether existing positions must also
+    be closed (see RiskLimitBreach's docstring).
 
     min_balance_floor is the user's own absolute stop (spec: "stopt bij
     €750") — distinct from max_drawdown (a percentage off the peak). It is
@@ -59,21 +75,29 @@ def check_account_wide_limits(
     if min_balance_floor is not None and state.equity <= min_balance_floor:
         raise RiskLimitBreach(
             f"Balance floor reached: equity {state.equity:.2f} <= your configured stop of "
-            f"{min_balance_floor:.2f}. No new trades — this is the limit you set yourself."
+            f"{min_balance_floor:.2f}. Circuit breaker: flatten all positions and halt trading "
+            "— this is the limit you set yourself.",
+            should_flatten=True, limit="min_balance_floor",
+        )
+
+    # Checked BEFORE max_daily_loss: both can be breached at once (a large
+    # single-day drop), and whichever raises first decides should_flatten.
+    # The flatten-worthy breach must win, or a simultaneous daily-loss
+    # breach would downgrade it to "pause only" and leave positions open.
+    drawdown = (state.peak_equity - state.equity) / state.peak_equity if state.peak_equity else 0.0
+    if drawdown >= max_drawdown:
+        raise RiskLimitBreach(
+            f"Max drawdown breached: {drawdown:.2%} >= {max_drawdown:.2%}. "
+            "Circuit breaker: flatten all positions and halt trading.",
+            should_flatten=True, limit="max_drawdown",
         )
 
     daily_loss_fraction = -state.daily_pnl / state.daily_start_equity if state.daily_start_equity else 0.0
     if daily_loss_fraction >= max_daily_loss:
         raise RiskLimitBreach(
             f"Daily loss limit breached: {daily_loss_fraction:.2%} >= {max_daily_loss:.2%}. "
-            "No new trades until the next trading day."
-        )
-
-    drawdown = (state.peak_equity - state.equity) / state.peak_equity if state.peak_equity else 0.0
-    if drawdown >= max_drawdown:
-        raise RiskLimitBreach(
-            f"Max drawdown breached: {drawdown:.2%} >= {max_drawdown:.2%}. "
-            "Circuit breaker: flatten all positions and halt trading."
+            "No new trades until the next trading day.",
+            should_flatten=False, limit="max_daily_loss",
         )
 
 

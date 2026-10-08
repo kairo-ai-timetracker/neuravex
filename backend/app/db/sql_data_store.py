@@ -457,9 +457,32 @@ class SqlDataStore:
                 for p in open_positions_rows
             }
 
+        # BUG FIX: daily_pnl was hardcoded to 0.0 (and daily_start_equity
+        # to the CURRENT equity), so risk_engine's max_daily_loss check
+        # could never fire. "Today" is the UTC calendar day (crypto has no
+        # session close); its starting equity is the last snapshot taken
+        # before UTC midnight, falling back to today's first snapshot for
+        # an account with no earlier history. Note: a withdrawal shows up
+        # here as a loss too, so it can trigger the (pause-only, no
+        # flatten) daily-loss stop for the rest of that day.
+        day_start = datetime(now.year, now.month, now.day)
+        snapshots_this_mode = self.session.query(m.PortfolioSnapshot).filter_by(
+            account_id=account_id, is_simulated=self.simulated,
+        )
+        day_start_snapshot = (
+            snapshots_this_mode.filter(m.PortfolioSnapshot.taken_at < day_start)
+            .order_by(m.PortfolioSnapshot.taken_at.desc())
+            .first()
+        ) or (
+            snapshots_this_mode.filter(m.PortfolioSnapshot.taken_at >= day_start)
+            .order_by(m.PortfolioSnapshot.taken_at.asc())
+            .first()
+        )
+        daily_start_equity = day_start_snapshot.equity if day_start_snapshot else equity
+
         return PortfolioState(
             equity=equity, peak_equity=peak_equity, cash=equity, open_positions=open_positions,
-            daily_pnl=0.0, daily_start_equity=equity,
+            daily_pnl=equity - daily_start_equity, daily_start_equity=daily_start_equity,
             trades_this_hour=trades_this_hour, last_entry_time=last_entry_time,
             last_signal_time_by_symbol=last_signal_time_by_symbol,
         )

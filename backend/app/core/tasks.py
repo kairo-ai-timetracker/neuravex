@@ -88,6 +88,30 @@ def _get_or_create_settings(session, account: m.Account) -> m.AccountSettings:
     return row
 
 
+def _lock_simulation_settings(session, account_settings: m.AccountSettings) -> m.AccountSettings:
+    """
+    Row-locks (SELECT ... FOR UPDATE) a simulation account's settings row
+    and re-reads it fresh. paper_balances/paper_positions are read at the
+    start of a tick, traded on in memory, and written back at the end — so
+    two writers overlapping (run_agent_tick and the manual close-all
+    endpoint) would otherwise silently overwrite each other, e.g. a tick
+    that started before a close-all writing the just-sold positions back.
+    With the lock, the second writer waits and then starts from the
+    first's committed balances. Held until the caller's transaction
+    commits (run_agent_tick commits per account for exactly that reason).
+    Live accounts don't need it: they keep no in-memory balances.
+    """
+    if not account_settings.paper_trading_enabled:
+        return account_settings
+    return (
+        session.query(m.AccountSettings)
+        .filter_by(account_id=account_settings.account_id)
+        .with_for_update()
+        .populate_existing()
+        .one()
+    )
+
+
 async def _build_paper_exchange(
     symbols: list[str], starting_balances: dict[str, float], starting_cost_basis: dict[str, float],
 ) -> tuple[PaperExchange, dict[str, float]]:
@@ -220,6 +244,152 @@ def _save_paper_snapshot(store: SqlDataStore, account_id: str, balances: dict[st
     ))
 
 
+def _build_agent_for_account(
+    session, account: m.Account, account_settings: m.AccountSettings,
+) -> tuple[NeuravexAgent, SqlDataStore, object, dict[str, float]]:
+    """
+    Builds the store/exchange/agent for one account exactly as a normal
+    tick runs it — shared by run_agent_tick and close_all_positions_for_
+    account (the manual close-all endpoint), so a manual close executes
+    through the very same simulation-vs-live and phone-vs-server paths as
+    an automatic one. Returns (agent, store, exchange, last_prices);
+    last_prices is empty for live accounts.
+    """
+    store = SqlDataStore(
+        session, simulated=account_settings.paper_trading_enabled,
+        fallback_equity=(
+            account_settings.paper_starting_balance if account_settings.paper_trading_enabled else None
+        ),
+    )
+    strategies = [
+        TrendFollowingStrategy(), MomentumStrategy(),
+        MeanReversionStrategy(), BreakoutStrategy(),
+    ]
+
+    last_prices: dict[str, float] = {}
+    if account_settings.paper_trading_enabled:
+        starting_balances = account_settings.paper_balances or {"USDC": account_settings.paper_starting_balance}
+        logger.info(
+            "Account %s is in SIMULATION mode — seeding paper exchange from: %s",
+            account.id, starting_balances,
+        )
+        # Every HELD asset needs a price too, not just the configured coin
+        # list: a coin the user has since removed from their list can still
+        # be held, and the paper exchange refuses to sell (and the snapshot
+        # can't value) anything it has no price for — which would leave
+        # such a position impossible to close by take-profit, circuit
+        # breaker or the close-all button.
+        price_symbols = list(dict.fromkeys([
+            *(account_settings.symbols or []),
+            *(f"{asset}/USDC" for asset, qty in starting_balances.items() if asset != "USDC" and qty > 0),
+        ]))
+        exchange, last_prices = asyncio.run(
+            _build_paper_exchange(
+                price_symbols, starting_balances,
+                account_settings.paper_positions,
+            )
+        )
+        execution_mode = "server"
+        trading_mode = "paper"
+        # Previously forced to None here on the reasoning that
+        # "the floor governs real money" — but the Settings screen
+        # shows this as a plain "stop trading when my balance
+        # reaches" field with no mention of live-vs-simulation, so
+        # a user testing a strategy in simulation reasonably
+        # expects their own configured stop to actually apply.
+        # (The profit side is per-trade now, not account-wide —
+        # see the take-profit sweep, not this field.)
+        min_balance_floor = account_settings.min_balance_floor
+    else:
+        exchange = PublicMarketDataExchange()
+        execution_mode = account_settings.execution_mode
+        trading_mode = account.mode.value
+        min_balance_floor = account_settings.min_balance_floor
+
+    config = AgentConfig(
+        symbols=account_settings.symbols or [],
+        # Fixed system defaults — not user-configurable by design.
+        # See AccountSettings' class docstring for why.
+        max_trade_risk=m.AccountSettings.DEFAULT_MAX_TRADE_RISK,
+        max_position_size=m.AccountSettings.DEFAULT_MAX_POSITION_SIZE,
+        max_portfolio_exposure=m.AccountSettings.DEFAULT_MAX_PORTFOLIO_EXPOSURE,
+        max_daily_loss=m.AccountSettings.DEFAULT_MAX_DAILY_LOSS,
+        max_drawdown=global_settings.risk.max_drawdown,
+        min_balance_floor=min_balance_floor,
+        max_open_positions=global_settings.risk.max_open_positions,
+        minimum_confidence=global_settings.strategy.minimum_confidence,
+        minimum_expected_edge=global_settings.strategy.minimum_expected_edge,
+        cooldown_seconds=global_settings.strategy.cooldown_seconds,
+        max_trades_per_hour=global_settings.strategy.max_trades_per_hour,
+        min_time_between_entries_seconds=global_settings.strategy.min_time_between_entries_seconds,
+        trading_mode=trading_mode,
+        allow_live_flag=global_settings.allow_live,
+        execution_mode=execution_mode,
+        dry_run=not account_settings.ai_enabled,
+    )
+    agent = NeuravexAgent(
+        exchange=exchange, strategies=strategies, store=store,
+        config=config, account_id=account.id,
+        strategy_performance=_compute_strategy_performance(session),
+    )
+    return agent, store, exchange, last_prices
+
+
+def _persist_paper_state(
+    store: SqlDataStore, account_id: str, account_settings: m.AccountSettings,
+    exchange: PaperExchange, last_prices: dict[str, float],
+) -> None:
+    """Writes a simulation account's in-memory PaperExchange balances back
+    to AccountSettings and records a PortfolioSnapshot — the only way any
+    simulated fill (buy, sell, take-profit, flatten) becomes permanent."""
+    updated_balances = exchange.get_all_balances()
+    account_settings.paper_balances = updated_balances
+    account_settings.paper_positions = exchange.get_cost_basis()
+    _save_paper_snapshot(store, account_id, updated_balances, last_prices)
+    logger.info(
+        "SIMULATION snapshot saved for account %s — balances now: %s",
+        account_id, updated_balances,
+    )
+
+
+def close_all_positions_for_account(session, account: m.Account, reason: str = "manual_close_all") -> dict:
+    """
+    Really closes every open position for one account — the backend of
+    the manual POST /api/emergency/{account_id}/close-all button. Same
+    underlying helper as the automatic circuit breaker
+    (NeuravexAgent.flatten_all_positions), built through the same
+    _build_agent_for_account as a normal tick, so:
+      - simulation: sells on the PaperExchange and persists the new
+        paper_balances/paper_positions + snapshot;
+      - live, phone mode: queues a full-quantity sell PendingExecution
+        per position for the phone to execute (the position is marked
+        closed only when the phone reports the fill, via execution.py's
+        _apply_fill_to_position — never assumed);
+      - live, server mode: places the order through the configured
+        adapter (the keyless PublicMarketDataExchange refuses, which is
+        reported back as a failure rather than silently "closed").
+    ignore_dry_run=True: the user explicitly pressed the button, so this
+    executes even with AI trading switched off.
+    """
+    account_settings = _lock_simulation_settings(session, _get_or_create_settings(session, account))
+    agent, store, exchange, last_prices = _build_agent_for_account(session, account, account_settings)
+    state = store.get_portfolio_state(account.id)
+    open_before = sorted(state.open_positions)
+    decisions = asyncio.run(agent.flatten_all_positions(state, reason, ignore_dry_run=True))
+    if account_settings.paper_trading_enabled:
+        _persist_paper_state(store, account.id, account_settings, exchange, last_prices)
+
+    attempted = {d.symbol for d in decisions}
+    return {
+        "execution": "simulation" if account_settings.paper_trading_enabled else agent.config.execution_mode,
+        "open_positions": open_before,
+        "submitted": sorted(d.symbol for d in decisions if d.executed),
+        "failed": sorted(d.symbol for d in decisions if not d.executed),
+        # Already had a sell in flight (pending/claimed) — not re-queued.
+        "already_in_flight": sorted(sym for sym in open_before if sym not in attempted),
+    }
+
+
 @celery_app.task(name="backend.app.core.tasks.run_agent_tick")
 def run_agent_tick() -> str:
     """
@@ -253,12 +423,6 @@ def run_agent_tick() -> str:
         accounts = session.query(m.Account).all()
         for account in accounts:
             account_settings = _get_or_create_settings(session, account)
-            store = SqlDataStore(
-                session, simulated=account_settings.paper_trading_enabled,
-                fallback_equity=(
-                    account_settings.paper_starting_balance if account_settings.paper_trading_enabled else None
-                ),
-            )
 
             if not account_settings.symbols:
                 logger.debug("No coins selected for account %s — skipping tick", account.id)
@@ -272,66 +436,8 @@ def run_agent_tick() -> str:
             # execution step is suppressed — see AgentConfig.dry_run and
             # NeuravexAgent's handling of it.
 
-            strategies = [
-                TrendFollowingStrategy(), MomentumStrategy(),
-                MeanReversionStrategy(), BreakoutStrategy(),
-            ]
-
-            if account_settings.paper_trading_enabled:
-                starting_balances = account_settings.paper_balances or {"USDC": account_settings.paper_starting_balance}
-                logger.info(
-                    "Account %s is in SIMULATION mode — seeding paper exchange from: %s",
-                    account.id, starting_balances,
-                )
-                exchange, last_prices = asyncio.run(
-                    _build_paper_exchange(
-                        account_settings.symbols, starting_balances,
-                        account_settings.paper_positions,
-                    )
-                )
-                execution_mode = "server"
-                trading_mode = "paper"
-                # Previously forced to None here on the reasoning that
-                # "the floor governs real money" — but the Settings screen
-                # shows this as a plain "stop trading when my balance
-                # reaches" field with no mention of live-vs-simulation, so
-                # a user testing a strategy in simulation reasonably
-                # expects their own configured stop to actually apply.
-                # (The profit side is per-trade now, not account-wide —
-                # see the take-profit sweep below, not this field.)
-                min_balance_floor = account_settings.min_balance_floor
-            else:
-                exchange = PublicMarketDataExchange()
-                execution_mode = account_settings.execution_mode
-                trading_mode = account.mode.value
-                min_balance_floor = account_settings.min_balance_floor
-
-            config = AgentConfig(
-                symbols=account_settings.symbols,
-                # Fixed system defaults — not user-configurable by design.
-                # See AccountSettings' class docstring for why.
-                max_trade_risk=m.AccountSettings.DEFAULT_MAX_TRADE_RISK,
-                max_position_size=m.AccountSettings.DEFAULT_MAX_POSITION_SIZE,
-                max_portfolio_exposure=m.AccountSettings.DEFAULT_MAX_PORTFOLIO_EXPOSURE,
-                max_daily_loss=m.AccountSettings.DEFAULT_MAX_DAILY_LOSS,
-                max_drawdown=global_settings.risk.max_drawdown,
-                min_balance_floor=min_balance_floor,
-                max_open_positions=global_settings.risk.max_open_positions,
-                minimum_confidence=global_settings.strategy.minimum_confidence,
-                minimum_expected_edge=global_settings.strategy.minimum_expected_edge,
-                cooldown_seconds=global_settings.strategy.cooldown_seconds,
-                max_trades_per_hour=global_settings.strategy.max_trades_per_hour,
-                min_time_between_entries_seconds=global_settings.strategy.min_time_between_entries_seconds,
-                trading_mode=trading_mode,
-                allow_live_flag=global_settings.allow_live,
-                execution_mode=execution_mode,
-                dry_run=not account_settings.ai_enabled,
-            )
-            agent = NeuravexAgent(
-                exchange=exchange, strategies=strategies, store=store,
-                config=config, account_id=account.id,
-                strategy_performance=_compute_strategy_performance(session),
-            )
+            account_settings = _lock_simulation_settings(session, account_settings)
+            agent, store, exchange, last_prices = _build_agent_for_account(session, account, account_settings)
             try:
                 decisions = asyncio.run(agent.run_tick())
                 logger.info("Tick complete for account %s: %d decisions", account.id, len(decisions))
@@ -346,17 +452,21 @@ def run_agent_tick() -> str:
                             exchange, store, account.id, last_prices, account_settings.max_balance_target,
                         )
                     )
-                    updated_balances = exchange.get_all_balances()
-                    account_settings.paper_balances = updated_balances
-                    account_settings.paper_positions = exchange.get_cost_basis()
-                    _save_paper_snapshot(store, account.id, updated_balances, last_prices)
-                    logger.info(
-                        "SIMULATION snapshot saved for account %s — balances now: %s",
-                        account.id, updated_balances,
-                    )
+                    _persist_paper_state(store, account.id, account_settings, exchange, last_prices)
             except Exception as e:  # noqa: BLE001 — one bad account must not kill the whole beat run
                 logger.exception("Agent tick failed for account %s: %s", account.id, e)
                 store.save_risk_event("agent_tick_failed", "warning", str(e), {"account_id": account.id})
+
+            # Commit per account (previously one commit for the whole beat
+            # run): releases this account's settings row lock (see
+            # _lock_simulation_settings) as soon as its tick is done, so a
+            # close-all waits for at most one account's tick, not all of
+            # them. A failed commit only loses this account's tick.
+            try:
+                session.commit()
+            except Exception as e:  # noqa: BLE001
+                session.rollback()
+                logger.exception("Commit failed for account %s tick: %s", account.id, e)
 
     return "ok"
 
