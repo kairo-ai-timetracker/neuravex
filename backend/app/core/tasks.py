@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
 
@@ -12,11 +12,15 @@ from backend.app.db.session import get_session
 from backend.app.db.sql_data_store import SqlDataStore
 from backend.app.models import models as m
 from trading_engine.agent import AgentConfig, NeuravexAgent, PlannedOrder
+from trading_engine.decision_engine import Decision, ScoreBreakdown
+from trading_engine.execution.exchange_interface import OrderType, Side
 from trading_engine.execution.paper_exchange import PaperExchange
 from trading_engine.execution.public_market_data import PublicMarketDataExchange
+from trading_engine.risk.exits import DEFAULT_SELL_COST_RATE, atr_stop_price, evaluate_exit
 from trading_engine.strategies.breakout import BreakoutStrategy
 from trading_engine.strategies.mean_reversion import MeanReversionStrategy
 from trading_engine.strategies.momentum import MomentumStrategy
+from trading_engine.strategies.performance import performance_score
 from trading_engine.strategies.trend_following import TrendFollowingStrategy
 
 logger = logging.getLogger("neuravex.tasks")
@@ -40,14 +44,15 @@ _HARD_STOP_LOSS_USDC = -10.0
 # for the same reason as the other constants here.
 _EQUITY_ALERT_THRESHOLD_USDC = 5.0
 
-# A strategy needs at least this many CLOSED, attributed trades (see
-# Strategy.closed_trades_count, updated by execution.py's
-# _update_strategy_performance) before its win rate is trusted at all in
-# _compute_strategy_performance below. Below this, one lucky or unlucky
-# early trade could swing a brand-new strategy's win rate straight to 0%
-# or 100% — it's treated as unproven (neutral, 0.0) instead, same as
-# before this feature existed.
-_MIN_TRADES_FOR_PERFORMANCE_WEIGHTING = 5
+# Candle timeframe the agent trades on — and the stop-loss ATR is measured
+# on. 4h instead of 1h after replaying both against the old bot
+# (scripts/replay_backtest.py, same coins, no fixed take-profit, no circuit
+# breaker): 2026-07-28..09-26 +25.9% vs -8.5% (117 vs 599 orders), and the
+# untouched 2026-09-26..10-08 window -2.8% vs -20.7%. Fewer, calmer
+# signals; far less paid in fees and slippage.
+_TIMEFRAME = "4h"
+_TIMEFRAME_SECONDS = 4 * 3600
+_CANDLE_LIMIT = 300
 
 
 def _compute_strategy_performance(session) -> dict[str, float]:
@@ -71,12 +76,12 @@ def _compute_strategy_performance(session) -> dict[str, float]:
     decision_engine's own 0.15 weight on this term keeps it a nudge, not
     a veto, exactly like every other score component.
     """
-    rows = (
-        session.query(m.Strategy)
-        .filter(m.Strategy.closed_trades_count >= _MIN_TRADES_FOR_PERFORMANCE_WEIGHTING)
-        .all()
-    )
-    return {s.name: max(-1.0, min(1.0, 2 * (s.historical_win_rate - 0.5))) for s in rows}
+    scores = {}
+    for s in session.query(m.Strategy).all():
+        score = performance_score(s.historical_win_rate or 0.0, s.closed_trades_count or 0)
+        if score is not None:
+            scores[s.name] = score
+    return scores
 
 
 def _get_or_create_settings(session, account: m.Account) -> m.AccountSettings:
@@ -136,9 +141,9 @@ async def _build_paper_exchange(
     last_prices: dict[str, float] = {}
     for symbol in symbols:
         try:
-            candles = await market_data.get_candles(symbol, "1h", 200)
+            candles = await market_data.get_candles(symbol, _TIMEFRAME, _CANDLE_LIMIT)
             if candles:
-                paper.load_candles(symbol, "1h", candles)
+                paper.load_candles(symbol, _TIMEFRAME, candles)
                 last_price = candles[-1].close
                 paper.update_price(symbol, last_price)
                 last_prices[symbol] = last_price
@@ -147,60 +152,71 @@ async def _build_paper_exchange(
     return paper, last_prices
 
 
-async def _apply_per_trade_take_profit(
+def _exit_decision(symbol: str, reason: str, detail: str) -> Decision:
+    """An executed SELL decision for a rule-based exit (stop-loss /
+    take-profit), so it shows up in the decision history like any other
+    trade AND counts for the cooldown / one-trade-per-candle checks.
+    Previously these sells left no ai_decisions row at all, so the agent
+    happily re-bought the same symbol a minute after every take-profit."""
+    return Decision(
+        symbol=symbol, action="SELL", direction="SHORT", confidence=1.0,
+        score=ScoreBreakdown(0, 0, 0, 0, 0, 0, 0, 0, 0),
+        reasons_for=[f"[{reason}] {detail}"],
+    )
+
+
+def _closed_candles(candles: list, timeframe_seconds: int = _TIMEFRAME_SECONDS) -> list:
+    now = datetime.now(timezone.utc)
+    return [c for c in candles if c.open_time + timedelta(seconds=timeframe_seconds) <= now]
+
+
+async def _apply_simulated_exits(
     exchange: PaperExchange, store: SqlDataStore, account_id: str,
     last_prices: dict[str, float], take_profit_usdc: float | None,
 ) -> None:
     """
-    Per-trade take-profit sweep (spec, redesigned from an account-wide
-    target: "ik wil een algemeen getal invullen... als de winst op die
-    trade €50 is dan stopt hij"). Runs AFTER the normal buy-decision tick,
-    so it sees this tick's own new positions too, not just older ones.
-
-    For every asset currently held with a known cost basis, if its own
-    unrealized profit (current value minus what was paid for it,
-    including the original buy fee) has reached take_profit_usdc, that
-    ONE position is sold — others keep running independently. This is
-    intentionally separate from min_balance_floor, which stays
-    account-wide on the loss side (the user's explicit choice).
-
-    The trigger compares against unrealized profit BEFORE the sell's own
-    fee and slippage are deducted — the actual amount credited back to
-    USDC will be a small fraction (the taker fee, ~0.1%) below the
-    configured target, not exactly equal to it. Not worth estimating
-    ahead of the real fill just to chase an exact number.
+    Per-position exits for SIMULATION, run after the normal tick so it
+    also sees positions that tick just opened:
+      - stop-loss: 1.5 x ATR below the cost basis (the stop agent.py
+        already computes at entry but never enforced), and
+      - the user's per-trade take-profit (max_balance_target), now judged
+        on profit NET of the sell's own fee + slippage.
+    See trading_engine/risk/exits.py for both rules. Each other position
+    keeps running independently.
     """
-    if take_profit_usdc is None:
-        return
-    from trading_engine.execution.exchange_interface import OrderType, Side
+    import numpy as np
 
     balances = exchange.get_all_balances()
     cost_basis = exchange.get_cost_basis()
     for asset, quantity in list(balances.items()):
         if asset == "USDC" or quantity <= 0:
             continue
+        symbol = f"{asset}/USDC"
         entry_price = cost_basis.get(asset)
-        price = next((p for sym, p in last_prices.items() if sym.startswith(f"{asset}/")), None)
+        price = last_prices.get(symbol)
         if entry_price is None or price is None:
             continue
-        unrealized_profit = (price - entry_price) * quantity
-        if unrealized_profit >= take_profit_usdc:
-            try:
-                order_result = await exchange.create_order(f"{asset}/USDC", Side.sell, OrderType.market, quantity)
-                # Previously missing entirely: the sell updated the
-                # simulated balances but was never written to the orders
-                # table, so it left no permanent record — invisible to
-                # any future trade history, and unavailable to the
-                # eventual learning-from-past-trades work discussed
-                # earlier. Recorded exactly the same way a normal
-                # buy/sell decision is (see agent.py's execution paths).
-                store.save_order_result(order_result, None, account_id)
-                logger.info(
-                    "SIMULATION take-profit: sold %.6f %s at unrealized profit %.2f USDC (target %.2f)",
-                    quantity, asset, unrealized_profit, take_profit_usdc,
-                )
-            except Exception as e:  # noqa: BLE001 — one failed close must not block others
-                logger.warning("Take-profit sell failed for %s: %s", asset, e)
+        candles = _closed_candles(await exchange.get_candles(symbol, _TIMEFRAME, _CANDLE_LIMIT))
+        stop = atr_stop_price(
+            entry_price, np.array([c.high for c in candles]), np.array([c.low for c in candles]),
+            np.array([c.close for c in candles]),
+        )
+        exit_ = evaluate_exit(
+            quantity=quantity, cost_basis=entry_price, price=price, stop_price=stop,
+            take_profit_usdc=take_profit_usdc,
+        )
+        if exit_ is None:
+            continue
+        try:
+            order_result = await exchange.create_order(symbol, Side.sell, OrderType.market, quantity)
+            decision = _exit_decision(symbol, exit_.reason, exit_.detail)
+            decision.executed = True
+            decision_id = store.save_decision(decision, account_id)
+            store.save_order_result(order_result, decision_id, account_id)
+            store.record_realized_trade(account_id, symbol, entry_price, order_result)
+            logger.info("SIMULATION %s: sold %.6f %s — %s", exit_.reason, quantity, asset, exit_.detail)
+        except Exception as e:  # noqa: BLE001 — one failed close must not block others
+            logger.warning("Simulated %s sell failed for %s: %s", exit_.reason, asset, e)
 
 
 def _save_paper_snapshot(store: SqlDataStore, account_id: str, balances: dict[str, float], last_prices: dict[str, float]) -> None:
@@ -280,7 +296,7 @@ def _build_agent_for_account(
         # such a position impossible to close by take-profit, circuit
         # breaker or the close-all button.
         price_symbols = list(dict.fromkeys([
-            *(account_settings.symbols or []),
+            *(sym for sym in (account_settings.symbols or []) if sym.endswith("/USDC")),
             *(f"{asset}/USDC" for asset, qty in starting_balances.items() if asset != "USDC" and qty > 0),
         ]))
         exchange, last_prices = asyncio.run(
@@ -291,6 +307,15 @@ def _build_agent_for_account(
         )
         execution_mode = "server"
         trading_mode = "paper"
+        # The simulated wallet only holds USDC, so a buy on an X/USDT pair
+        # always failed with InsufficientBalanceError — ~5,800
+        # symbol_processing_failed events, every one a wasted analysis.
+        # Simulation trades the USDC pairs only; the USDT ones remain in
+        # the user's list for live use.
+        trade_symbols = [sym for sym in (account_settings.symbols or []) if sym.endswith("/USDC")]
+        skipped = sorted(set(account_settings.symbols or []) - set(trade_symbols))
+        if skipped:
+            logger.info("Account %s SIMULATION: skipping non-USDC pairs %s", account.id, skipped)
         # Previously forced to None here on the reasoning that
         # "the floor governs real money" — but the Settings screen
         # shows this as a plain "stop trading when my balance
@@ -305,9 +330,11 @@ def _build_agent_for_account(
         execution_mode = account_settings.execution_mode
         trading_mode = account.mode.value
         min_balance_floor = account_settings.min_balance_floor
+        trade_symbols = account_settings.symbols or []
 
     config = AgentConfig(
-        symbols=account_settings.symbols or [],
+        symbols=trade_symbols,
+        timeframe=_TIMEFRAME, candle_limit=_CANDLE_LIMIT,
         # Fixed system defaults — not user-configurable by design.
         # See AccountSettings' class docstring for why.
         max_trade_risk=m.AccountSettings.DEFAULT_MAX_TRADE_RISK,
@@ -448,7 +475,7 @@ def run_agent_tick() -> str:
                     # (e.g. a large favorable price move) rather than
                     # waiting a full 5-minute cycle.
                     asyncio.run(
-                        _apply_per_trade_take_profit(
+                        _apply_simulated_exits(
                             exchange, store, account.id, last_prices, account_settings.max_balance_target,
                         )
                     )
@@ -477,7 +504,7 @@ def check_live_exits() -> str:
     Fast, lightweight companion to run_agent_tick, on its own much shorter
     beat schedule (see celery_app.py — every ~30s vs. the main tick's
     1-minute analysis cycle). This is the LIVE counterpart of
-    _apply_per_trade_take_profit, which only ever ran for simulation —
+    _apply_simulated_exits, which only ever ran for simulation —
     live accounts had no per-trade profit target enforcement at all until
     this task existed (see backend/app/api/execution.py's
     _apply_fill_to_position for the other missing half: the `positions`
@@ -497,8 +524,9 @@ def check_live_exits() -> str:
             account_settings = _get_or_create_settings(session, account)
             if account_settings.paper_trading_enabled:
                 continue  # simulation's own sweep already runs inside run_agent_tick
-            if not account_settings.max_balance_target:
-                continue  # no per-trade profit target configured — nothing to check
+            # NOTE: no longer skipping accounts without a take-profit target —
+            # that `continue` also silently disabled the stop-loss checks
+            # below for every such account.
 
             store = SqlDataStore(session, simulated=False)
             open_positions = (
@@ -526,46 +554,44 @@ def check_live_exits() -> str:
                     continue
 
                 unrealized_profit = (ticker.bid - position.entry_price) * position.quantity
-                if unrealized_profit >= account_settings.max_balance_target:
-                    store.save_pending_execution(
-                        account.id, None,
-                        PlannedOrder(
-                            symbol=position.symbol, side="sell", quantity=position.quantity,
-                            stop_loss=0.0, take_profit_1=0.0, take_profit_2=0.0, confidence=1.0,
-                            reasons_for=[
-                                f"Live per-trade take-profit: unrealized profit "
-                                f"{unrealized_profit:.2f} USDC >= target {account_settings.max_balance_target:.2f} USDC"
-                            ],
-                            reasons_against=[],
-                        ),
-                    )
-                    logger.info(
-                        "Live take-profit triggered for account %s %s: unrealized %.2f >= target %.2f",
-                        account.id, position.symbol, unrealized_profit, account_settings.max_balance_target,
-                    )
+                # Same rule as simulation (trading_engine/risk/exits.py): the
+                # ATR stop recorded at entry (Position.stop_loss, from the
+                # PendingExecution's risk plan) and the take-profit judged on
+                # profit net of the sell's costs. position.entry_price is the
+                # raw fill price, so the buy-side cost is added back in too.
+                exit_ = evaluate_exit(
+                    quantity=position.quantity,
+                    cost_basis=position.entry_price * (1 + DEFAULT_SELL_COST_RATE),
+                    price=ticker.bid,
+                    stop_price=position.stop_loss or None,
+                    take_profit_usdc=account_settings.max_balance_target,
+                )
+                if exit_ is not None:
+                    reason_text = f"[{exit_.reason}] Live {exit_.reason.replace('_', '-')}: {exit_.detail}"
+                    log = logger.warning if exit_.reason == "stop_loss" else logger.info
+                    log("Live %s for account %s %s: %s", exit_.reason, account.id, position.symbol, exit_.detail)
                 elif unrealized_profit <= _HARD_STOP_LOSS_USDC:
                     # Pure noodrem — see _HARD_STOP_LOSS_USDC's comment.
-                    # This is deliberately separate from the AI's own
-                    # signal-driven close (agent.py's SHORT-on-held-symbol
-                    # path), which is expected to exit earlier/smarter than
-                    # this in almost every case; this only fires as a
-                    # backstop if that hasn't happened.
-                    store.save_pending_execution(
-                        account.id, None,
-                        PlannedOrder(
-                            symbol=position.symbol, side="sell", quantity=position.quantity,
-                            stop_loss=0.0, take_profit_1=0.0, take_profit_2=0.0, confidence=1.0,
-                            reasons_for=[
-                                f"Hard stop-loss backstop: unrealized loss "
-                                f"{unrealized_profit:.2f} USDC <= {_HARD_STOP_LOSS_USDC:.2f} USDC"
-                            ],
-                            reasons_against=[],
-                        ),
+                    # Backstop for positions without a recorded stop, or if
+                    # the stop itself was set too wide.
+                    reason_text = (
+                        f"Hard stop-loss backstop: unrealized loss "
+                        f"{unrealized_profit:.2f} USDC <= {_HARD_STOP_LOSS_USDC:.2f} USDC"
                     )
                     logger.warning(
                         "Hard stop-loss triggered for account %s %s: unrealized %.2f <= %.2f",
                         account.id, position.symbol, unrealized_profit, _HARD_STOP_LOSS_USDC,
                     )
+                else:
+                    continue
+                store.save_pending_execution(
+                    account.id, None,
+                    PlannedOrder(
+                        symbol=position.symbol, side="sell", quantity=position.quantity,
+                        stop_loss=0.0, take_profit_1=0.0, take_profit_2=0.0, confidence=1.0,
+                        reasons_for=[reason_text], reasons_against=[],
+                    ),
+                )
 
     return "ok"
 

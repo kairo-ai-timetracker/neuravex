@@ -19,7 +19,7 @@ Two providers are implemented:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -57,6 +57,13 @@ _WRAPPED_TOKEN_ANALYSIS_PROXY = {
 }
 
 
+# Hourly candles per Coinbase product, kept across calls in this process
+# ({open_time_epoch: [time, low, high, open, close, volume]}) so 4h candles
+# (built from 1h, see get_candles) need one request per call once warm,
+# instead of re-downloading ~50 days of history every tick.
+_HOURLY_CACHE: dict[str, dict[int, list]] = {}
+
+
 class CoinbasePublicMarketDataExchange(Exchange):
     """Keyless market data via Coinbase Exchange's public REST API.
 
@@ -70,13 +77,14 @@ class CoinbasePublicMarketDataExchange(Exchange):
 
     # Binance-style interval strings (as already used throughout the agent
     # config / DB) mapped to Coinbase's `granularity` in seconds. Coinbase
-    # has no native 4h bucket; "4h" maps to the nearest available (6h).
+    # has no native 4h bucket — "4h" used to be silently mapped to 6h here;
+    # it is now built from 1h candles instead (see _four_hour_candles), so
+    # the agent gets exactly what it asked for.
     _TIMEFRAME_TO_GRANULARITY_SECONDS = {
         "1m": 60,
         "5m": 300,
         "15m": 900,
         "1h": 3600,
-        "4h": 21600,  # nearest available Coinbase bucket is 6h
         "6h": 21600,
         "1d": 86400,
     }
@@ -131,6 +139,8 @@ class CoinbasePublicMarketDataExchange(Exchange):
 
     async def get_candles(self, symbol: str, timeframe: str, limit: int = 500) -> list[Candle]:
         product_id = self._to_product_id(symbol)
+        if timeframe == "4h":
+            return await self._four_hour_candles(product_id, limit)
         granularity = self._TIMEFRAME_TO_GRANULARITY_SECONDS.get(timeframe)
         if granularity is None:
             raise ExchangeConnectionError(
@@ -152,6 +162,48 @@ class CoinbasePublicMarketDataExchange(Exchange):
             )
             for c in raw_sorted
         ]
+
+    async def _four_hour_candles(self, product_id: str, limit: int) -> list[Candle]:
+        """4h candles aggregated from 1h, in UTC-aligned buckets (00:00,
+        04:00, ... 20:00) — the same buckets scripts/replay_backtest.py
+        evaluated. The last bucket can still be forming; the agent drops it."""
+        hourly = await self._hourly_history(product_id, hours=limit * 4 + 4)
+        buckets: dict[int, list[list]] = {}
+        for ts in sorted(hourly):
+            buckets.setdefault(ts // 14_400 * 14_400, []).append(hourly[ts])
+        candles = [
+            Candle(
+                open_time=datetime.fromtimestamp(start, tz=timezone.utc),
+                open=float(rows[0][3]), high=max(float(r[2]) for r in rows), low=min(float(r[1]) for r in rows),
+                close=float(rows[-1][4]), volume=sum(float(r[5]) for r in rows),
+            )
+            for start, rows in sorted(buckets.items())
+        ]
+        return candles[-limit:]
+
+    async def _hourly_history(self, product_id: str, hours: int) -> dict[int, list]:
+        cache = _HOURLY_CACHE.setdefault(product_id, {})
+        now = datetime.now(timezone.utc)
+        oldest_needed = int((now - timedelta(hours=hours)).timestamp())
+        if cache and min(cache) <= oldest_needed:
+            # Warm: the newest page (up to 300h) is enough to refresh the
+            # forming hour and any hours closed since the last call.
+            for row in await self._get(f"/products/{product_id}/candles", {"granularity": 3600}):
+                cache[int(row[0])] = row
+        else:
+            end = now
+            while int(end.timestamp()) > oldest_needed:
+                start = end - timedelta(hours=self._MAX_CANDLES_PER_REQUEST)
+                rows = await self._get(f"/products/{product_id}/candles", {
+                    "granularity": 3600,
+                    "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                })
+                for row in rows:
+                    cache[int(row[0])] = row
+                end = start
+        for ts in [ts for ts in cache if ts < oldest_needed - 4 * 3600]:
+            del cache[ts]
+        return dict(cache)
 
     async def create_order(self, symbol: str, side: Side, order_type: OrderType, quantity: float, price: float | None = None) -> OrderResult:
         raise NotImplementedError(

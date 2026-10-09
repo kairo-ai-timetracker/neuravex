@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.api.auth import require_account_owner
 from backend.app.db.session import get_db
+from backend.app.db.sql_data_store import apply_strategy_result
 from backend.app.models import models as m
 
 router = APIRouter(prefix="/api/execution", tags=["execution"])
@@ -207,15 +208,4 @@ def _update_strategy_performance(db: Session, position: m.Position, quantity_clo
     pnl_per_unit = position.realized_pnl / quantity_closed if quantity_closed else position.realized_pnl
     won = position.realized_pnl > 0
 
-    for strategy_name in opening_decision.contributing_strategies:
-        strategy = db.query(m.Strategy).filter_by(name=strategy_name).first()
-        if strategy is None:
-            continue
-        n = strategy.closed_trades_count
-        new_n = n + 1
-        # Incremental (running) average — equivalent to recomputing the
-        # mean over every attributed trade so far, but as a single O(1)
-        # update rather than replaying history.
-        strategy.historical_win_rate = (strategy.historical_win_rate * n + (1.0 if won else 0.0)) / new_n
-        strategy.historical_expectancy = (strategy.historical_expectancy * n + pnl_per_unit) / new_n
-        strategy.closed_trades_count = new_n
+    apply_strategy_result(db, opening_decision.contributing_strategies, won=won, pnl_per_unit=pnl_per_unit)

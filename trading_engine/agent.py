@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Protocol
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Protocol
 
 import numpy as np
 
@@ -28,6 +28,8 @@ from trading_engine.signals.indicators import atr
 from trading_engine.strategies.base import OHLCV, Strategy
 
 logger = logging.getLogger("neuravex.agent")
+
+_TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14_400, "1d": 86_400}
 
 # Tag carried by every Decision/PendingExecution produced by
 # flatten_all_positions for an automatic account-wide circuit breaker
@@ -60,6 +62,7 @@ class DataStore(Protocol):
     def save_pending_execution(self, account_id: str, decision_id: str | None, plan: PlannedOrder) -> None: ...
     def get_portfolio_state(self, account_id: str) -> PortfolioState: ...
     def has_pending_order(self, account_id: str, symbol: str, side: str) -> bool: ...
+    def record_realized_trade(self, account_id: str, symbol: str, entry_price: float | None, order_result) -> None: ...
 
 
 @dataclass
@@ -99,6 +102,32 @@ class AgentConfig:
     # `ai_enabled` switch (see backend/app/core/tasks.py) — it is not
     # itself a user-facing setting.
     dry_run: bool = False
+    # Strategies only ever see CLOSED candles. The tick runs every minute on
+    # 1h candles, and the market-data feed includes the still-forming
+    # current hour as its last candle — so every indicator (RSI, MACD, the
+    # "volume above average" checks) was being recomputed on a candle that
+    # changes minute to minute. That made signals flip within the hour
+    # ("LONG 80%" then "SHORT 80%" on the same candle) and the bot churned
+    # in and out of positions, paying fees each time.
+    closed_candles_only: bool = True
+    # At most one trade decision per symbol per closed candle: after
+    # entering or exiting a symbol, the next decision on it waits until a
+    # NEW candle has closed. With closed candles the signal is identical
+    # for the rest of the hour, so without this the same signal re-entered
+    # right after every take-profit/stop exit.
+    one_trade_per_candle: bool = True
+    # Round-trip cost estimate fed to the decision engine (net edge must
+    # beat it). Was hardcoded to 0.1%; the real paper/CEX round trip is
+    # ~0.3% (2 x 0.1% taker fee + 2 x 5 bps slippage).
+    estimated_transaction_cost: float = 0.003
+    # Entry filters (new positions only — exits are never filtered). The
+    # defaults keep the original behaviour; see scripts/replay_backtest.py
+    # for how alternatives are evaluated before being switched on.
+    # Minimum number of strategies that must agree on a LONG entry.
+    min_agreeing_strategies: int = 1
+    # If set, only open new positions while the symbol's market regime is
+    # one of these (MarketRegime values, e.g. ("BULL", "STRONG_BULL")).
+    entry_regimes: tuple[str, ...] | None = None
 
 
 class NeuravexAgent:
@@ -111,6 +140,7 @@ class NeuravexAgent:
         account_id: str,
         strategy_performance: dict[str, float] | None = None,
         correlation_matrix: dict[str, dict[str, float]] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.exchange = exchange
         self.strategies = strategies
@@ -119,6 +149,9 @@ class NeuravexAgent:
         self.account_id = account_id
         self.strategy_performance = strategy_performance or {}
         self.correlation_matrix = correlation_matrix or {}
+        # Naive-UTC "now", injectable so scripts/replay_backtest.py can
+        # replay history through this exact code path.
+        self._now = clock or datetime.utcnow
 
     async def run_tick(self) -> list[Decision]:
         decisions: list[Decision] = []
@@ -176,6 +209,14 @@ class NeuravexAgent:
 
     async def _process_symbol(self, symbol: str, state: PortfolioState) -> Decision | None:
         candles = await self.exchange.get_candles(symbol, self.config.timeframe, self.config.candle_limit)
+        if not candles:
+            return None
+        # The latest price, even when it comes from the still-forming candle
+        # that the strategies below no longer look at — used as the entry
+        # price for sizing and the stop.
+        current_price = float(candles[-1].close)
+        if self.config.closed_candles_only:
+            candles = self._closed_candles(candles)
         if len(candles) < 60:
             return None
 
@@ -209,13 +250,24 @@ class NeuravexAgent:
             strategy_performance=self.strategy_performance,
             volume_confirmation_score=volume_confirmation,
             correlation_penalty=correlation_penalty,
-            estimated_transaction_cost=0.001,
+            estimated_transaction_cost=self.config.estimated_transaction_cost,
             minimum_confidence=self.config.minimum_confidence,
             minimum_expected_edge=self.config.minimum_expected_edge,
         )
 
         if decision.action == "NO_TRADE":
             return decision
+
+        if self.config.one_trade_per_candle and self.config.closed_candles_only:
+            last_closed_at = self._candle_close_time(candles[-1])
+            last_trade_at = state.last_signal_time_by_symbol.get(symbol)
+            if last_trade_at is not None and _as_naive_utc(last_trade_at) >= last_closed_at:
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append(
+                    f"Already traded {symbol} since the last closed candle ({last_closed_at:%H:%M} UTC) — "
+                    "waiting for a new candle before trading it again"
+                )
+                return decision
 
         direction = decision.direction
 
@@ -280,7 +332,23 @@ class NeuravexAgent:
             )
             return await self._close_position(symbol, held_quantity, decision, state)
 
-        entry = float(data.close[-1])
+        if direction == "LONG":
+            if len(decision.contributing_signals) < self.config.min_agreeing_strategies:
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append(
+                    f"Only {len(decision.contributing_signals)} strategy agrees — entries need "
+                    f"{self.config.min_agreeing_strategies}"
+                )
+                return decision
+            if self.config.entry_regimes is not None and regime.market_regime.value not in self.config.entry_regimes:
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append(
+                    f"Market regime {regime.market_regime.value} — new positions only in "
+                    f"{', '.join(self.config.entry_regimes)}"
+                )
+                return decision
+
+        entry = current_price
         atr_value = float(atr(data.high, data.low, data.close)[-1])
         plan = build_risk_plan(entry=entry, direction=direction, atr_value=atr_value)
 
@@ -320,6 +388,7 @@ class NeuravexAgent:
             correlated_symbols=correlated, cooldown_seconds=self.config.cooldown_seconds,
             max_trades_per_hour=self.config.max_trades_per_hour,
             min_time_between_entries_seconds=self.config.min_time_between_entries_seconds,
+            now=self._now(),
         )
         if not risk_check.approved:
             decision.action = "NO_TRADE"
@@ -509,12 +578,14 @@ class NeuravexAgent:
         )
         order_result = await self.exchange.create_order(symbol, Side.sell, OrderType.market, quantity)
         self.store.save_order_result(order_result, decision_id, self.account_id)
+        self.store.record_realized_trade(
+            self.account_id, symbol, state.open_positions.get(symbol, {}).get("entry_price"), order_result,
+        )
         decision.executed = True
         self._release_position_in_state(state, symbol)
         return decision
 
-    @staticmethod
-    def _reserve_entry_in_state(state: PortfolioState, symbol: str, quantity: float, entry_price: float) -> None:
+    def _reserve_entry_in_state(self, state: PortfolioState, symbol: str, quantity: float, entry_price: float) -> None:
         """
         BUG FIX: run_tick() fetches `state` ONCE per tick and reuses that
         same snapshot for every symbol in self.config.symbols — but every
@@ -543,13 +614,12 @@ class NeuravexAgent:
             "notional": quantity * entry_price, "quantity": quantity, "entry_price": entry_price,
         }
         state.cash = max(0.0, state.cash - quantity * entry_price)
-        now = datetime.utcnow()
+        now = self._now()
         state.trades_this_hour += 1
         state.last_entry_time = now
         state.last_signal_time_by_symbol[symbol] = now
 
-    @staticmethod
-    def _release_position_in_state(state: PortfolioState, symbol: str) -> None:
+    def _release_position_in_state(self, state: PortfolioState, symbol: str) -> None:
         """
         Same reasoning as _reserve_entry_in_state, for the close side: a
         symbol closed earlier in this tick must stop showing up in
@@ -563,4 +633,28 @@ class NeuravexAgent:
         live account.
         """
         state.open_positions.pop(symbol, None)
-        state.last_signal_time_by_symbol[symbol] = datetime.utcnow()
+        state.last_signal_time_by_symbol[symbol] = self._now()
+
+    def _timeframe_seconds(self) -> int:
+        seconds = _TIMEFRAME_SECONDS.get(self.config.timeframe)
+        if seconds is None:
+            raise ValueError(f"Unknown timeframe {self.config.timeframe!r}")
+        return seconds
+
+    def _candle_close_time(self, candle) -> datetime:
+        return _as_naive_utc(candle.open_time) + timedelta(seconds=self._timeframe_seconds())
+
+    def _closed_candles(self, candles: list) -> list:
+        """Drops the trailing candle(s) that haven't closed yet."""
+        now = self._now()
+        end = len(candles)
+        while end and self._candle_close_time(candles[end - 1]) > now:
+            end -= 1
+        return candles[:end]
+
+
+def _as_naive_utc(ts: datetime) -> datetime:
+    """Candle times arrive tz-aware (UTC); the rest of the engine uses naive UTC."""
+    if ts.tzinfo is not None:
+        return ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts

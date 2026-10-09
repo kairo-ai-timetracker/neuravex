@@ -32,6 +32,9 @@ class RecordingStore:
     def has_pending_order(self, account_id, symbol, side):
         return False
 
+    def record_realized_trade(self, account_id, symbol, entry_price, order_result):
+        pass
+
     def save_risk_event(self, event_type, severity, message, context):
         self.risk_events.append((event_type, severity, message, context))
 

@@ -14,6 +14,23 @@ from sqlalchemy.orm import Session
 from backend.app.models import models as m
 from trading_engine.decision_engine import Decision
 from trading_engine.risk.risk_engine import PortfolioState
+from trading_engine.strategies.performance import update_running_stats
+
+
+def apply_strategy_result(session: Session, strategy_names: list[str], *, won: bool, pnl_per_unit: float) -> None:
+    """Folds one closed trade into each contributing strategy's running
+    win rate / expectancy. Shared by the live path (execution.py) and the
+    simulated path (SqlDataStore.record_realized_trade)."""
+    for name in strategy_names:
+        strategy = session.query(m.Strategy).filter_by(name=name).first()
+        if strategy is None:
+            continue
+        (
+            strategy.historical_win_rate, strategy.historical_expectancy, strategy.closed_trades_count,
+        ) = update_running_stats(
+            strategy.historical_win_rate or 0.0, strategy.historical_expectancy or 0.0,
+            strategy.closed_trades_count or 0, won=won, pnl_per_unit=pnl_per_unit,
+        )
 
 
 def _json_safe(value):
@@ -277,6 +294,43 @@ class SqlDataStore:
             .first()
             is not None
         )
+
+    def record_realized_trade(self, account_id: str, symbol: str, entry_price: float | None, order_result) -> None:
+        """
+        Strategy learning for SIMULATED closes. Live closes are attributed
+        when the phone reports the fill (execution.py's
+        _apply_fill_to_position -> _update_strategy_performance); simulated
+        sells never go through that path, which is why every strategy still
+        showed closed_trades_count=0 after weeks of simulation and the
+        decision engine's strategy_performance term never kicked in.
+
+        A simulated position keeps no opening-decision link (only a cost
+        basis in AccountSettings.paper_positions), so the strategies are
+        taken from the most recent executed BUY decision for this symbol.
+        Note: the strategies table is shared, so this track record also
+        informs live trading — deliberately, since simulation runs on real
+        market prices.
+        """
+        if not self.simulated or entry_price is None or entry_price <= 0 or not order_result.filled_quantity:
+            return
+        if order_result.side.value != "sell":
+            return
+        opening = (
+            self.session.query(m.AIDecision)
+            .filter(
+                m.AIDecision.account_id == account_id, m.AIDecision.symbol == symbol,
+                m.AIDecision.action == m.DecisionAction.buy, m.AIDecision.executed.is_(True),
+            )
+            .order_by(m.AIDecision.created_at.desc())
+            .first()
+        )
+        if opening is None or not opening.contributing_strategies:
+            return
+        qty = order_result.filled_quantity
+        # entry_price is the paper cost basis (buy fee already included);
+        # subtract the sell fee too, so a "win" is a win after costs.
+        realized = (order_result.average_fill_price - entry_price) * qty - (order_result.fee or 0.0)
+        apply_strategy_result(self.session, opening.contributing_strategies, won=realized > 0, pnl_per_unit=realized / qty)
 
     def expire_stale_pending_executions(self, account_id: str) -> int:
         """
