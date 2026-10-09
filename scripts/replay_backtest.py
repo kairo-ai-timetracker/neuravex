@@ -50,7 +50,9 @@ from trading_engine.execution.exchange_interface import Candle, OrderType, Side 
 from trading_engine.execution.paper_exchange import PaperExchange  # noqa: E402
 from trading_engine.execution.public_market_data import CoinbasePublicMarketDataExchange  # noqa: E402
 from trading_engine.risk.exits import atr_stop_price, evaluate_exit  # noqa: E402
-from trading_engine.risk.risk_engine import PortfolioState, RiskLimitBreach, check_account_wide_limits  # noqa: E402
+from trading_engine.risk.risk_engine import (  # noqa: E402
+    DRAWDOWN_HALT_COOLDOWN, PortfolioState, RiskLimitBreach, check_account_wide_limits,
+)
 from trading_engine.strategies.breakout import BreakoutStrategy  # noqa: E402
 from trading_engine.strategies.mean_reversion import MeanReversionStrategy  # noqa: E402
 from trading_engine.strategies.momentum import MomentumStrategy  # noqa: E402
@@ -194,7 +196,8 @@ class ReplayStore:
         self.recorded: set = set()
         self.next_id = 0
         self.decisions: dict[str, Decision] = {}
-        self.equity_history: list[float] = []
+        self.equity_history: list[tuple[datetime, float]] = []
+        self.drawdown_halt_at: datetime | None = None
         self.day_start_equity: dict = {}
         self.risk_events = Counter()
         self.buy_strategies: dict[str, list[str]] = {}
@@ -242,6 +245,21 @@ class ReplayStore:
     def has_pending_order(self, account_id, symbol, side):
         return False
 
+    def note_drawdown_halt(self, account_id, message):
+        # Same rule as SqlDataStore.note_drawdown_halt (new mode only — the
+        # old code had no drawdown stop expiry).
+        if self.mode == "new" and (
+            self.drawdown_halt_at is None or self.now >= self.drawdown_halt_at + DRAWDOWN_HALT_COOLDOWN
+        ):
+            self.drawdown_halt_at = self.now
+
+    def drawdown_peak(self, equity: float) -> float:
+        history = self.equity_history
+        if self.drawdown_halt_at is not None and self.now >= self.drawdown_halt_at + DRAWDOWN_HALT_COOLDOWN:
+            resume = self.drawdown_halt_at + DRAWDOWN_HALT_COOLDOWN
+            history = [(t, e) for t, e in history if t >= resume]
+        return max([e for _, e in history] + [equity])
+
     def record_realized_trade(self, account_id, symbol, entry_price, order_result):
         if self.mode != "new" or not entry_price:
             return
@@ -262,7 +280,7 @@ class ReplayStore:
 
     def get_portfolio_state(self, account_id):
         equity = self.equity()
-        peak = max(self.equity_history + [equity])
+        peak = self.drawdown_peak(equity)
         if self.mode == "new":
             day = self.now.date()
             daily_start = self.day_start_equity.setdefault(day, equity)
@@ -394,7 +412,7 @@ async def replay(args) -> dict:
         await exit_sweep(args.mode, exchange, store, views, now_ts, args.take_profit)
 
         equity = store.equity()
-        store.equity_history.append(equity)
+        store.equity_history.append((now, equity))
         curve.append((now.isoformat(), round(equity, 2)))
 
     eq = np.array([e for _, e in curve])

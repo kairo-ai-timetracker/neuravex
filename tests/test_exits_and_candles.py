@@ -79,6 +79,7 @@ class _Store:
     def get_portfolio_state(self, account_id): return self.state
     def has_pending_order(self, *a): return False
     def record_realized_trade(self, *a): pass
+    def note_drawdown_halt(self, *a): pass
 
 
 class _CandleExchange:

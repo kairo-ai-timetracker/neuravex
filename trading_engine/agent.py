@@ -63,6 +63,7 @@ class DataStore(Protocol):
     def get_portfolio_state(self, account_id: str) -> PortfolioState: ...
     def has_pending_order(self, account_id: str, symbol: str, side: str) -> bool: ...
     def record_realized_trade(self, account_id: str, symbol: str, entry_price: float | None, order_result) -> None: ...
+    def note_drawdown_halt(self, account_id: str, message: str) -> None: ...
 
 
 @dataclass
@@ -187,6 +188,8 @@ class NeuravexAgent:
             # tasks.py's check_live_exits hard stop-loss already runs
             # regardless of ai_enabled. Otherwise a floor hit while AI is
             # off would leave every open position bleeding past it.
+            if e.limit == "max_drawdown":
+                self.store.note_drawdown_halt(self.account_id, str(e))
             if e.should_flatten:
                 decisions.extend(
                     await self.flatten_all_positions(

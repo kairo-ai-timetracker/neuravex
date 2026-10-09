@@ -35,6 +35,9 @@ class RecordingStore:
     def record_realized_trade(self, account_id, symbol, entry_price, order_result):
         pass
 
+    def note_drawdown_halt(self, account_id, message):
+        pass
+
     def save_risk_event(self, event_type, severity, message, context):
         self.risk_events.append((event_type, severity, message, context))
 

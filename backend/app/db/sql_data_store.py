@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.models import models as m
 from trading_engine.decision_engine import Decision
-from trading_engine.risk.risk_engine import PortfolioState
+from trading_engine.risk.risk_engine import DRAWDOWN_HALT_COOLDOWN, PortfolioState
 from trading_engine.strategies.performance import update_running_stats
 
 
@@ -295,6 +295,43 @@ class SqlDataStore:
             is not None
         )
 
+    def _drawdown_halt_event_type(self) -> str:
+        # Simulation and live keep separate drawdown histories (see
+        # PortfolioSnapshot.is_simulated), so their halts must not mix either.
+        return "drawdown_halt_sim" if self.simulated else "drawdown_halt_live"
+
+    def latest_drawdown_halt(self, account_id: str) -> datetime | None:
+        return (
+            self.session.query(func.max(m.RiskEvent.created_at))
+            .filter(m.RiskEvent.account_id == account_id, m.RiskEvent.event_type == self._drawdown_halt_event_type())
+            .scalar()
+        )
+
+    def note_drawdown_halt(self, account_id: str, message: str) -> None:
+        """Records the START of a max_drawdown stop (once per stop — repeated
+        breaches during the same stop don't move it). See
+        DRAWDOWN_HALT_COOLDOWN for what happens when it expires."""
+        latest = self.latest_drawdown_halt(account_id)
+        if latest is not None and datetime.utcnow() < latest + DRAWDOWN_HALT_COOLDOWN:
+            return
+        self.session.add(m.RiskEvent(
+            account_id=str(account_id), event_type=self._drawdown_halt_event_type(), severity="critical",
+            message=message[:1000],
+            context={"resumes_at": (datetime.utcnow() + DRAWDOWN_HALT_COOLDOWN).isoformat()},
+        ))
+
+    def drawdown_peak_equity(self, account_id: str) -> float | None:
+        """Highest equity the drawdown is measured from: all snapshots, or —
+        once a drawdown stop has run its DRAWDOWN_HALT_COOLDOWN — only the
+        snapshots since it expired."""
+        query = self.session.query(func.max(m.PortfolioSnapshot.equity)).filter(
+            m.PortfolioSnapshot.account_id == account_id, m.PortfolioSnapshot.is_simulated.is_(self.simulated),
+        )
+        halt = self.latest_drawdown_halt(account_id)
+        if halt is not None and datetime.utcnow() >= halt + DRAWDOWN_HALT_COOLDOWN:
+            query = query.filter(m.PortfolioSnapshot.taken_at >= halt + DRAWDOWN_HALT_COOLDOWN)
+        return query.scalar()
+
     def record_realized_trade(self, account_id: str, symbol: str, entry_price: float | None, order_result) -> None:
         """
         Strategy learning for SIMULATED closes. Live closes are attributed
@@ -387,13 +424,7 @@ class SqlDataStore:
         )
         default_equity = self.fallback_equity if self.fallback_equity is not None else account.starting_balance
         equity = latest_snapshot.equity if latest_snapshot else default_equity
-        peak_equity = max(
-            (
-                s.equity for s in
-                self.session.query(m.PortfolioSnapshot).filter_by(account_id=account_id, is_simulated=self.simulated)
-            ),
-            default=equity,
-        )
+        peak_equity = max(self.drawdown_peak_equity(account_id) or equity, equity)
 
         # BUG FIX: trades_this_hour / last_entry_time / last_signal_time_by_
         # symbol were never populated — every call returned the dataclass

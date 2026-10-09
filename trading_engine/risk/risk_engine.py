@@ -9,7 +9,7 @@ overridden by an LLM or by strategy confidence (spec §16).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 @dataclass
@@ -31,6 +31,15 @@ class RiskCheckResult:
     reason: str
     severity: str = "info"
     correlation_penalty: float = 0.0
+
+
+# How long a max_drawdown stop lasts. After it, the drawdown is measured
+# from a fresh peak (the equity at that moment) so trading can resume;
+# a further 10% loss from there trips a new stop. Without this, one
+# drawdown halted the account forever (the peak never comes back while the
+# account sits in cash) — in the 2026-07..09 replay the bot stopped on
+# 08-30 and missed the rest of the move.
+DRAWDOWN_HALT_COOLDOWN = timedelta(days=7)
 
 
 class RiskLimitBreach(Exception):

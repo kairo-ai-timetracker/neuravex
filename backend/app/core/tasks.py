@@ -4,8 +4,6 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func
-
 from backend.app.core.celery_app import celery_app
 from backend.app.core.config import settings as global_settings
 from backend.app.db.session import get_session
@@ -243,13 +241,10 @@ def _save_paper_snapshot(store: SqlDataStore, account_id: str, balances: dict[st
     # true historical peak_equity — run_agent_tick calls this for
     # simulation accounts exactly the same as live ones) was tripped and
     # silently halting this account's own trading. Both paths must agree
-    # on the same true-historical-peak definition of drawdown, not one
-    # hardcoded/partial and the other correct.
-    historical_peak_equity = (
-        store.session.query(func.max(m.PortfolioSnapshot.equity))
-        .filter_by(account_id=account_id, is_simulated=True)
-        .scalar()
-    )
+    # on the same definition of drawdown, not one hardcoded/partial and the
+    # other correct — hence the same drawdown_peak_equity the agent uses
+    # (which restarts from a fresh peak once a drawdown stop expires).
+    historical_peak_equity = store.drawdown_peak_equity(account_id)
     peak_equity = max(equity, historical_peak_equity) if historical_peak_equity else equity
     drawdown = (peak_equity - equity) / peak_equity if peak_equity else 0.0
 
