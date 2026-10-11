@@ -19,6 +19,7 @@ Two providers are implemented:
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -108,10 +109,22 @@ class CoinbasePublicMarketDataExchange(Exchange):
         # wrapped tokens. Execution still uses the real on-chain quote asset.
         return f"{base}-USD"
 
-    async def _get(self, path: str, params: dict) -> dict | list:
-        headers = {"User-Agent": _USER_AGENT}
-        async with httpx.AsyncClient(timeout=self.timeout, headers=headers) as client:
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=self.timeout, headers={"User-Agent": _USER_AGENT})
+
+    async def _get(self, path: str, params: dict, client: httpx.AsyncClient | None = None) -> dict | list:
+        if client is None:
+            async with self._client() as own_client:
+                return await self._get(path, params, own_client)
+        # Coinbase's public limit is ~10 requests/second. A cold 4h history
+        # fetch (5 pages per coin) can exceed it — seen live on 2026-10-11,
+        # when 4 of 13 coins were skipped for a tick on 429s. Back off and
+        # retry instead of dropping the coin.
+        for delay in (0.5, 1.0, 2.0, None):
             resp = await client.get(f"{self.base_url}{path}", params=params)
+            if resp.status_code == 429 and delay is not None:
+                await asyncio.sleep(delay)
+                continue
             if resp.status_code != 200:
                 raise ExchangeConnectionError(f"Coinbase public API error {resp.status_code}: {resp.text}")
             return resp.json()
@@ -192,15 +205,19 @@ class CoinbasePublicMarketDataExchange(Exchange):
                 cache[int(row[0])] = row
         else:
             end = now
-            while int(end.timestamp()) > oldest_needed:
-                start = end - timedelta(hours=self._MAX_CANDLES_PER_REQUEST)
-                rows = await self._get(f"/products/{product_id}/candles", {
-                    "granularity": 3600,
-                    "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                })
-                for row in rows:
-                    cache[int(row[0])] = row
-                end = start
+            # One connection for all pages: a fresh TLS handshake per page
+            # made a cold fetch of 13 coins take over a minute.
+            async with self._client() as client:
+                while int(end.timestamp()) > oldest_needed:
+                    start = end - timedelta(hours=self._MAX_CANDLES_PER_REQUEST)
+                    rows = await self._get(f"/products/{product_id}/candles", {
+                        "granularity": 3600,
+                        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }, client)
+                    for row in rows:
+                        cache[int(row[0])] = row
+                    end = start
+                    await asyncio.sleep(0.1)  # stay under the public rate limit while paging
         for ts in [ts for ts in cache if ts < oldest_needed - 4 * 3600]:
             del cache[ts]
         return dict(cache)
