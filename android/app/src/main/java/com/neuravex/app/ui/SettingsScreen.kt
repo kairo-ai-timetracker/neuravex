@@ -579,12 +579,16 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                     singleLine = true,
                 )
                 TextButton(onClick = {
-                    val amount = profitTargetText.toDoubleOrNull()
-                    if (amount == null || amount <= 0) {
+                    // Blank (or 0) = no take-profit; the backend treats 0
+                    // as "off". Previously blank was rejected here, so a
+                    // target could never be removed again.
+                    val amount = if (profitTargetText.isBlank()) 0.0 else profitTargetText.toDoubleOrNull()
+                    if (amount == null || amount < 0) {
                         statusMessage = "Enter a valid amount"
                         return@TextButton
                     }
                     persist(AccountSettingsUpdate(max_balance_target = amount)) { success, error ->
+                        if (success && amount == 0.0) profitTargetText = ""
                         statusMessage = if (success) "Saved" else error
                     }
                 }) { Text("Save profit target") }

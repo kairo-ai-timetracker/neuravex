@@ -42,8 +42,8 @@ class AccountSettingsUpdate(BaseModel):
         default=None, gt=0, description="Absolute balance amount — the AI stops trading once equity reaches this."
     )
     max_balance_target: float | None = Field(
-        default=None, gt=0,
-        description="Per-trade take-profit, in USDC-equivalent — any single open position is sold as soon as its own unrealized profit reaches this amount. Not account-wide.",
+        default=None, ge=0,
+        description="Per-trade take-profit, in USDC-equivalent — any single open position is sold as soon as its own unrealized profit reaches this amount. Not account-wide. 0 turns it off.",
     )
     ai_enabled: bool | None = Field(default=None, description="The on/off switch for autonomous trading.")
     execution_venue: str | None = Field(default=None, description="'cex' or 'wallet'")
@@ -104,6 +104,10 @@ def update_settings(
         changes["symbols"] = req.symbols
     for field_name, value in changes.items():
         setattr(settings_row, field_name, value)
+    # 0 = "no take-profit". None can't express that here: exclude_none
+    # above drops it, so a set target could never be cleared again.
+    if req.max_balance_target == 0:
+        settings_row.max_balance_target = None
     if req.paper_starting_balance is not None:
         # A new fictional starting amount means a fresh simulation, not a
         # top-up of the running one — reset the persisted running
