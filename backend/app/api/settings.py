@@ -109,6 +109,18 @@ def update_settings(
     if req.max_balance_target == 0:
         settings_row.max_balance_target = None
     if req.paper_starting_balance is not None:
+        # Logged so a reset is traceable afterwards — without it a reset
+        # looked like the simulation "changing its own balance".
+        db.add(m.SystemEvent(
+            event_type="simulation_reset",
+            message=f"Simulation reset to {req.paper_starting_balance:.2f} for account {account_id}",
+            context={
+                "account_id": str(account_id),
+                "new_starting_balance": req.paper_starting_balance,
+                "previous_balances": settings_row.paper_balances,
+                "previous_positions": settings_row.paper_positions,
+            },
+        ))
         # A new fictional starting amount means a fresh simulation, not a
         # top-up of the running one — reset the persisted running
         # balances AND cost basis so the next tick seeds cleanly from the

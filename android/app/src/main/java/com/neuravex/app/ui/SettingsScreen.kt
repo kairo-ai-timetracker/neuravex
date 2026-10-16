@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
@@ -73,6 +74,8 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
     var paperTradingEnabled by remember { mutableStateOf(true) }
     var paperStartingBalanceText by remember { mutableStateOf("1000") }
     var paperEquity by remember { mutableStateOf(1000.0) }
+    // Amount awaiting confirmation; non-null shows the reset dialog.
+    var pendingResetEur by remember { mutableStateOf<Double?>(null) }
     // BUG FIX: the backend's paper_starting_balance / paper_equity are
     // USD-equivalent (paper_balances is literally seeded as {"USDC": ...}
     // — see settings.py) — the exact same "raw dollar number shown with a
@@ -507,21 +510,44 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                             statusMessage = "Enter a valid amount"
                             return@TextButton
                         }
-                        // The field is labeled "(€)" and the user typed a
-                        // euro amount — the backend's paper_starting_balance
-                        // is USD-equivalent (see the field comment above),
-                        // so convert before sending. Without this, a typed
-                        // "1000" (meant as €1000) was stored as $1000 —
-                        // correct on the backend, but a different number
-                        // the instant the Dashboard converted it back to
-                        // euros for display.
-                        val rate = usdToEurRate
-                        val amountUsd = if (rate != null && rate > 0) amountEur / rate else amountEur
-                        persist(AccountSettingsUpdate(paper_starting_balance = amountUsd)) { success, error ->
-                            statusMessage = if (success) "Simulation reset to €%.0f".format(amountEur) else error
-                            if (success) paperEquity = amountEur
-                        }
+                        // A reset wipes the running simulation (balances,
+                        // open positions, history) — never on one tap.
+                        pendingResetEur = amountEur
                     }) { Text("Reset simulation to this amount") }
+                    pendingResetEur?.let { amountEur ->
+                        AlertDialog(
+                            onDismissRequest = { pendingResetEur = null },
+                            title = { Text("Reset simulation?") },
+                            text = {
+                                Text(
+                                    "This deletes the current simulation (€%.2f, open positions and history) and starts over with €%.0f."
+                                        .format(paperEquity, amountEur)
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = {
+                                    pendingResetEur = null
+                                    // The field is labeled "(€)" and the user typed a
+                                    // euro amount — the backend's paper_starting_balance
+                                    // is USD-equivalent (see the field comment above),
+                                    // so convert before sending. Without this, a typed
+                                    // "1000" (meant as €1000) was stored as $1000 —
+                                    // correct on the backend, but a different number
+                                    // the instant the Dashboard converted it back to
+                                    // euros for display.
+                                    val rate = usdToEurRate
+                                    val amountUsd = if (rate != null && rate > 0) amountEur / rate else amountEur
+                                    persist(AccountSettingsUpdate(paper_starting_balance = amountUsd)) { success, error ->
+                                        statusMessage = if (success) "Simulation reset to €%.0f".format(amountEur) else error
+                                        if (success) paperEquity = amountEur
+                                    }
+                                }) { Text("Reset") }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { pendingResetEur = null }) { Text("Cancel") }
+                            },
+                        )
+                    }
                 }
             }
         }
