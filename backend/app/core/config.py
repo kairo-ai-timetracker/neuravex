@@ -11,7 +11,10 @@ import os
 from pathlib import Path
 from typing import Literal
 
-import yaml
+try:
+    import yaml
+except ImportError:  # e.g. Python 3.15, for which PyYAML has no wheel yet
+    yaml = None
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
@@ -75,7 +78,53 @@ def _load_yaml_overrides() -> dict:
     if not yaml_path.exists():
         return {}
     with open(yaml_path) as f:
-        return yaml.safe_load(f) or {}
+        text = f.read()
+    if yaml is not None:
+        return yaml.safe_load(text) or {}
+    return _parse_simple_yaml(text)
+
+
+def _parse_scalar(raw: str):
+    lowered = raw.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    if lowered in ("null", "~", ""):
+        return None
+    for cast in (int, float):
+        try:
+            return cast(raw)
+        except ValueError:
+            pass
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    return raw
+
+
+def _parse_simple_yaml(text: str) -> dict:
+    """Fallback for when PyYAML isn't installed: reads the subset that
+    config/neuravex.yaml uses — nested "key: value" mappings by
+    indentation, "# comments" and plain scalars. Anything else raises
+    rather than being silently misread."""
+    root: dict = {}
+    stack: list[tuple[int, dict]] = [(-1, root)]
+    for lineno, line in enumerate(text.splitlines(), 1):
+        content = line.split(" #", 1)[0].rstrip()
+        if not content.strip() or content.lstrip().startswith("#"):
+            continue
+        indent = len(content) - len(content.lstrip(" "))
+        key, sep, value = content.strip().partition(":")
+        if not sep or not key or key.startswith("- "):
+            raise ValueError(f"neuravex.yaml line {lineno}: unsupported without PyYAML: {line!r}")
+        while stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1]
+        value = value.strip()
+        if value:
+            parent[key] = _parse_scalar(value)
+        else:
+            parent[key] = {}
+            stack.append((indent, parent[key]))
+    return root
 
 
 def load_settings() -> NeuravexSettings:

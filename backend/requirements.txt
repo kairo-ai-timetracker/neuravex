@@ -1,5 +1,6 @@
 fastapi
-uvicorn[standard]
+uvicorn[standard]; python_version < "3.15"
+uvicorn; python_version >= "3.15"
 sqlalchemy
 alembic
 psycopg2-binary
@@ -12,7 +13,7 @@ bcrypt
 python-multipart
 websockets
 numpy
-pyyaml
+pyyaml; python_version < "3.15"  # 3.15: no wheel yet, config.py falls back
 httpx
 pytest
 pytest-asyncio
