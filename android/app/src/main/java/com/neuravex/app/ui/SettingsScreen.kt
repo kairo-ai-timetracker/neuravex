@@ -113,6 +113,9 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
     // cleared first, then the normal "enter + save" fields reappear.
     var isReplacingKey by remember { mutableStateOf(false) }
 
+    // The backend works in USD-equivalent; these fields are labeled and typed in euros.
+    fun eurToUsd(eur: Double): Double = usdToEurRate?.takeIf { it > 0 }?.let { eur / it } ?: eur
+
     fun persist(update: AccountSettingsUpdate, onDone: (Boolean, String?) -> Unit) {
         scope.launch {
             try {
@@ -168,8 +171,8 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                             if (success) configStore.coinDefaultsVersion = COIN_DEFAULTS_VERSION
                         }
                     }
-                    balanceFloorText = s.min_balance_floor?.let { "%.0f".format(it) } ?: ""
-                    profitTargetText = s.max_balance_target?.let { "%.0f".format(it) } ?: ""
+                    balanceFloorText = s.min_balance_floor?.let { "%.0f".format(it * rate) } ?: ""
+                    profitTargetText = s.max_balance_target?.let { "%.0f".format(it * rate) } ?: ""
                     aiEnabled = s.ai_enabled
                     paperTradingEnabled = s.paper_trading_enabled
                     // Both are USD from the backend — see the field
@@ -577,7 +580,7 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                         statusMessage = "Enter a valid amount"
                         return@TextButton
                     }
-                    persist(AccountSettingsUpdate(min_balance_floor = amount)) { success, error ->
+                    persist(AccountSettingsUpdate(min_balance_floor = eurToUsd(amount))) { success, error ->
                         statusMessage = if (success) "Saved" else error
                     }
                 }) { Text("Save stop amount") }
@@ -618,7 +621,7 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                         statusMessage = "Enter a valid amount"
                         return@TextButton
                     }
-                    persist(AccountSettingsUpdate(max_balance_target = amount)) { success, error ->
+                    persist(AccountSettingsUpdate(max_balance_target = eurToUsd(amount))) { success, error ->
                         if (success && amount == 0.0) profitTargetText = ""
                         statusMessage = if (success) "Saved" else error
                     }

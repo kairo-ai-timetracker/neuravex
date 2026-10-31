@@ -25,7 +25,7 @@ from trading_engine.risk.risk_engine import (
     check_trade_against_limits,
 )
 from trading_engine.risk.risk_plan import build_risk_plan
-from trading_engine.signals.indicators import atr
+from trading_engine.signals.indicators import atr, ema
 from trading_engine.strategies.base import OHLCV, Strategy
 
 logger = logging.getLogger("neuravex.agent")
@@ -149,6 +149,10 @@ class AgentConfig:
     analysis_log_window_seconds: int | None = None
     # See trading_engine/supervisor.py.
     supervisor_enabled: bool = False
+    # If set, a sell signal only closes a held position once the price is
+    # below this EMA, so a dip inside a rising trend doesn't end the trade.
+    # Stop-losses and circuit breakers are not affected.
+    signal_exit_ema: int | None = None
 
 
 class NeuravexAgent:
@@ -339,6 +343,11 @@ class NeuravexAgent:
             if held_quantity <= 0:
                 decision.action = "NO_TRADE"
                 decision.reasons_against.append("No held quantity available to close")
+                return decision
+            exit_ema = self.config.signal_exit_ema
+            if exit_ema is not None and data.close[-1] >= ema(data.close, exit_ema)[-1]:
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append(f"Sell signal ignored: price is still above its EMA{exit_ema}")
                 return decision
             # This tick's own PortfolioState was read at the START of
             # run_tick() and only reflects the `positions` table — it does

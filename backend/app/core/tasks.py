@@ -354,6 +354,7 @@ def _build_agent_for_account(
         dry_run=not account_settings.ai_enabled,
         analysis_log_window_seconds=300,
         supervisor_enabled=True,
+        signal_exit_ema=20,
         round_trip_cost_by_symbol=ROUND_TRIP_COST,
     )
     agent = NeuravexAgent(

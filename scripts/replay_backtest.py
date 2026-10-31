@@ -393,6 +393,7 @@ async def replay(args) -> dict:
         entry_regimes=tuple(args.entry_regimes) if args.entry_regimes else None,
         timeframe_aware_regime=not args.legacy_regime,
         supervisor_enabled=args.supervisor,
+        signal_exit_ema=args.exit_ema,
         round_trip_cost_by_symbol=ROUND_TRIP_COST if args.real_costs else None,
     )
     strategies = [TrendFollowingStrategy(), MomentumStrategy(), MeanReversionStrategy(), BreakoutStrategy()]
@@ -489,6 +490,7 @@ def main():
     ap.add_argument("--entry-regimes", nargs="+", help="e.g. BULL STRONG_BULL")
     ap.add_argument("--label", help="free text echoed in the result")
     ap.add_argument("--real-costs", action="store_true", help="measured on-chain cost per coin")
+    ap.add_argument("--exit-ema", type=int, help="sell signals only close below this EMA")
     ap.add_argument("--supervisor", action="store_true", help="feedback layer: stake and strategy gate")
     ap.add_argument("--legacy-regime", action="store_true", help="old 1h volatility/crash assumptions on any timeframe")
     args = ap.parse_args()
