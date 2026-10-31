@@ -295,7 +295,7 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
             item {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     GlassCard(modifier = Modifier.weight(1f), glow = if (ov.daily_pnl >= 0) NeuravexColors.Profit else NeuravexColors.Loss) {
-                        TileLabel("Today")
+                        TileLabel("Since start")
                         CountingText(
                             value = ov.daily_pnl * (rate ?: 1.0),
                             format = { "${if (it >= 0) "+" else "-"}${if (rate != null) "€" else "$"}%,.2f".format(kotlin.math.abs(it)) },
