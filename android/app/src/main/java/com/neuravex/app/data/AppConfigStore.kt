@@ -83,6 +83,11 @@ class AppConfigStore(context: Context) {
      * responsibility. All three are null/empty together, or all three
      * are set together — see setCustomToken()/clearCustomToken() below.
      */
+    /** Coin list version last switched on in full; see SettingsScreen. */
+    var coinDefaultsVersion: Int
+        get() = prefs.getInt("coin_defaults_version", 0)
+        set(value) = prefs.edit().putInt("coin_defaults_version", value).apply()
+
     var customTokenSymbol: String?
         get() = prefs.getString(KEY_CUSTOM_SYMBOL, null)
         private set(value) = prefs.edit().putString(KEY_CUSTOM_SYMBOL, value).apply()

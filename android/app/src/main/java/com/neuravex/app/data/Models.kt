@@ -179,13 +179,13 @@ data class WalletHeldAsset(
 )
 
 object SupportedPolygonCoins {
-    // Every tradable base asset in PolygonTokenRegistry, quoted in USDC.
+    // Every coin with a usable swap route (see PolygonRoutes), quoted in USDC.
     // Rebuilt dynamically (not a fixed list) so the user's custom 14th
     // token — set via Settings, see PolygonTokenRegistry.setCustomToken —
     // shows up here automatically once defined, with no separate list to
     // keep in sync.
     val ALL: List<String>
         get() = com.neuravex.app.data.PolygonTokenRegistry.ALL
-            .filter { it.symbol != "USDC" && it.symbol != "USDT" && it.symbol != "DAI" }
+            .filter { it.symbol in PolygonRoutes.TRADABLE_SYMBOLS || it == PolygonTokenRegistry.customToken() }
             .map { "${it.symbol}/USDC" }
 }

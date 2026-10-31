@@ -29,9 +29,10 @@ import java.math.BigInteger
  * anywhere else. See PolygonTokenRegistry.kt for the (independently
  * verified) token/contract addresses this relies on.
  *
- * BUY uses `exactOutputSingle` (the risk engine gives a target holding
- * size), SELL uses `exactInputSingle` (an amount of an existing position
- * to liquidate).
+ * BUY uses exact output (the risk engine gives a target holding size), SELL
+ * uses exact input (an amount of an existing position to liquidate). The
+ * pools come from PolygonRoutes: one pool uses the *Single calls, a route
+ * through a hub token uses exactInput/exactOutput.
  */
 class PolygonDexExecutionClient(
     privateKeyHex: String,
@@ -90,22 +91,27 @@ class PolygonDexExecutionClient(
             )
         }
 
-        val quotedAmountOut = quoteExactInputSingle(tokenIn.address, tokenOut.address, amountIn)
+        val hops = PolygonRoutes.between(tokenIn, tokenOut)
+        val quotedAmountOut = quoteIn(hops, amountIn)
             ?: return ExecutionResult(success = false, errorMessage = "No quote available for ${tokenIn.symbol}/${tokenOut.symbol} — pool may lack liquidity")
         val amountOutMinimum = applySlippage(quotedAmountOut, reduce = true)
 
         ensureApproval(tokenIn.address, amountIn, gasPrice)?.let { return it }
 
         val deadline = deadlineFromNow()
-        val params = StaticStruct(
-            Address(tokenIn.address), Address(tokenOut.address),
-            Uint24(BigInteger.valueOf(PolygonNetwork.DEFAULT_POOL_FEE_TIER.toLong())),
-            Address(walletAddress), Uint256(deadline), Uint256(amountIn), Uint256(amountOutMinimum), Uint160(BigInteger.ZERO),
-        )
-        val function = Function("exactInputSingle", listOf(params), listOf(object : TypeReference<Uint256>() {}))
+        val function = if (hops.isDirect) {
+            val params = StaticStruct(
+                Address(tokenIn.address), Address(tokenOut.address),
+                Uint24(BigInteger.valueOf(hops.fees[0].toLong())),
+                Address(walletAddress), Uint256(deadline), Uint256(amountIn), Uint256(amountOutMinimum), Uint160(BigInteger.ZERO),
+            )
+            Function("exactInputSingle", listOf(params), listOf(object : TypeReference<Uint256>() {}))
+        } else {
+            UniswapEncoding.routerCall("exactInput", UniswapEncoding.path(hops), walletAddress, deadline, amountIn, amountOutMinimum)
+        }
 
         val txHash = try {
-            sendContractTransaction(PolygonNetwork.UNISWAP_V3_SWAP_ROUTER, function, gasPrice, GAS_LIMIT_SWAP)
+            sendContractTransaction(PolygonNetwork.UNISWAP_V3_SWAP_ROUTER, function, gasPrice, if (hops.isDirect) GAS_LIMIT_SWAP else GAS_LIMIT_SWAP_TWO_POOLS)
         } catch (e: Exception) {
             return ExecutionResult(success = false, errorMessage = "Swap transaction rejected: ${e.message}")
         }
@@ -129,7 +135,8 @@ class PolygonDexExecutionClient(
     ): ExecutionResult {
         val amountOut = toRawAmount(amountOutHuman, tokenOut.decimals)
 
-        val quotedAmountIn = quoteExactOutputSingle(tokenIn.address, tokenOut.address, amountOut)
+        val hops = PolygonRoutes.between(tokenIn, tokenOut)
+        val quotedAmountIn = quoteOut(hops, amountOut)
             ?: return ExecutionResult(success = false, errorMessage = "No quote available for ${tokenIn.symbol}/${tokenOut.symbol} — pool may lack liquidity")
         val amountInMaximum = applySlippage(quotedAmountIn, reduce = false)
 
@@ -145,15 +152,21 @@ class PolygonDexExecutionClient(
         ensureApproval(tokenIn.address, amountInMaximum, gasPrice)?.let { return it }
 
         val deadline = deadlineFromNow()
-        val params = StaticStruct(
-            Address(tokenIn.address), Address(tokenOut.address),
-            Uint24(BigInteger.valueOf(PolygonNetwork.DEFAULT_POOL_FEE_TIER.toLong())),
-            Address(walletAddress), Uint256(deadline), Uint256(amountOut), Uint256(amountInMaximum), Uint160(BigInteger.ZERO),
-        )
-        val function = Function("exactOutputSingle", listOf(params), listOf(object : TypeReference<Uint256>() {}))
+        val function = if (hops.isDirect) {
+            val params = StaticStruct(
+                Address(tokenIn.address), Address(tokenOut.address),
+                Uint24(BigInteger.valueOf(hops.fees[0].toLong())),
+                Address(walletAddress), Uint256(deadline), Uint256(amountOut), Uint256(amountInMaximum), Uint160(BigInteger.ZERO),
+            )
+            Function("exactOutputSingle", listOf(params), listOf(object : TypeReference<Uint256>() {}))
+        } else {
+            // exactOutput takes its path backwards: output token first.
+            val backwards = PolygonRoutes.Hops(hops.tokens.reversed(), hops.fees.reversed())
+            UniswapEncoding.routerCall("exactOutput", UniswapEncoding.path(backwards), walletAddress, deadline, amountOut, amountInMaximum)
+        }
 
         val txHash = try {
-            sendContractTransaction(PolygonNetwork.UNISWAP_V3_SWAP_ROUTER, function, gasPrice, GAS_LIMIT_SWAP)
+            sendContractTransaction(PolygonNetwork.UNISWAP_V3_SWAP_ROUTER, function, gasPrice, if (hops.isDirect) GAS_LIMIT_SWAP else GAS_LIMIT_SWAP_TWO_POOLS)
         } catch (e: Exception) {
             return ExecutionResult(success = false, errorMessage = "Swap transaction rejected: ${e.message}")
         }
@@ -169,28 +182,32 @@ class PolygonDexExecutionClient(
         )
     }
 
-    private fun quoteExactInputSingle(tokenIn: String, tokenOut: String, amountIn: BigInteger): BigInteger? {
-        val function = Function(
+    private fun quoteIn(hops: PolygonRoutes.Hops, amountIn: BigInteger): BigInteger? {
+        val function = if (hops.isDirect) Function(
             "quoteExactInputSingle",
             listOf(
-                Address(tokenIn), Address(tokenOut),
-                Uint24(BigInteger.valueOf(PolygonNetwork.DEFAULT_POOL_FEE_TIER.toLong())),
+                Address(hops.tokens[0]), Address(hops.tokens[1]),
+                Uint24(BigInteger.valueOf(hops.fees[0].toLong())),
                 Uint256(amountIn), Uint160(BigInteger.ZERO),
             ),
             listOf(object : TypeReference<Uint256>() {}),
-        )
+        ) else UniswapEncoding.quoterCall("quoteExactInput", UniswapEncoding.path(hops), amountIn)
         return callAndDecodeUint256(PolygonNetwork.UNISWAP_V3_QUOTER, function)
     }
 
-    private fun quoteExactOutputSingle(tokenIn: String, tokenOut: String, amountOut: BigInteger): BigInteger? {
-        val function = Function(
+    private fun quoteOut(hops: PolygonRoutes.Hops, amountOut: BigInteger): BigInteger? {
+        val function = if (hops.isDirect) Function(
             "quoteExactOutputSingle",
             listOf(
-                Address(tokenIn), Address(tokenOut),
-                Uint24(BigInteger.valueOf(PolygonNetwork.DEFAULT_POOL_FEE_TIER.toLong())),
+                Address(hops.tokens[0]), Address(hops.tokens[1]),
+                Uint24(BigInteger.valueOf(hops.fees[0].toLong())),
                 Uint256(amountOut), Uint160(BigInteger.ZERO),
             ),
             listOf(object : TypeReference<Uint256>() {}),
+        ) else UniswapEncoding.quoterCall(
+            "quoteExactOutput",
+            UniswapEncoding.path(PolygonRoutes.Hops(hops.tokens.reversed(), hops.fees.reversed())),
+            amountOut,
         )
         return callAndDecodeUint256(PolygonNetwork.UNISWAP_V3_QUOTER, function)
     }
@@ -378,7 +395,7 @@ class PolygonDexExecutionClient(
         try {
             val nativeBalanceWei = getNativeBalanceOrZero()
             if (nativeBalanceWei > BigInteger.ZERO) {
-                val quoted = quoteExactInputSingle(PolygonTokenRegistry.WMATIC.address, PolygonTokenRegistry.USDC.address, nativeBalanceWei)
+                val quoted = quoteIn(PolygonRoutes.between(PolygonTokenRegistry.WMATIC, PolygonTokenRegistry.USDC), nativeBalanceWei)
                 if (quoted != null) {
                     val usdValue = fromRawAmount(quoted, PolygonTokenRegistry.USDC.decimals)
                     total = total.add(usdValue)
@@ -410,7 +427,7 @@ class PolygonDexExecutionClient(
                     assets += AssetBalance(token.symbol, qty.toDouble(), 1.0)
                     heldAssets += WalletHeldAsset(token.symbol, "Polygon", qty.toDouble(), usdValue.toDouble())
                 } else {
-                    val quoted = quoteExactInputSingle(token.address, PolygonTokenRegistry.USDC.address, balance)
+                    val quoted = quoteIn(PolygonRoutes.between(token, PolygonTokenRegistry.USDC), balance)
                     if (quoted != null) {
                         val usdValue = fromRawAmount(quoted, PolygonTokenRegistry.USDC.decimals)
                         total = total.add(usdValue)
@@ -479,6 +496,7 @@ class PolygonDexExecutionClient(
         private val MAX_GAS_PRICE_WEI: BigInteger = BigInteger.valueOf(1000).multiply(BigInteger.TEN.pow(9))
         private const val GAS_LIMIT_APPROVE = 80_000L
         private const val GAS_LIMIT_SWAP = 300_000L
+        private const val GAS_LIMIT_SWAP_TWO_POOLS = 450_000L
         private const val RECEIPT_POLL_INTERVAL_MS = 3_000L
         private const val RECEIPT_POLL_MAX_ATTEMPTS = 40
         private const val DEADLINE_SECONDS = 300L

@@ -63,7 +63,10 @@ object PolygonTokenRegistry {
     // ---- Additional tradable base assets (all against USDC) -----------
     // All 18 decimals unless noted; verified individually against
     // PolygonScan on the date each was added to this file.
-    val LINK = Token("LINK", "0xb0897686c545045aFc77CF20eC7A532E3120E0F1", 18)
+    // The bridged LINK that has Uniswap V3 liquidity on Polygon; the ERC-677
+    // LINK at 0xb0897686c545045aFc77CF20eC7A532E3120E0F1 has no pool at all.
+    val LINK = Token("LINK", "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39", 18)
+    val LDO = Token("LDO", "0xC3C7d422809852031b44ab29EEC9F1EfF2A58756", 18)
     val AAVE = Token("AAVE", "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", 18)
     val UNI = Token("UNI", "0xb33EaAd8d922B1083446DC23f610c2567fB5180f", 18)
     val CRV = Token("CRV", "0x172370d5Cd63279eFa6d502DAB29171933a610AF", 18)
@@ -81,7 +84,7 @@ object PolygonTokenRegistry {
     // setCustomToken() below — see Settings.
     private val BUILT_IN = listOf(
         WMATIC, WETH, WBTC, USDC, USDT, DAI,
-        LINK, AAVE, UNI, CRV, SAND, MANA, SUSHI, ONE_INCH, COMP, BAL,
+        LINK, AAVE, UNI, CRV, SAND, MANA, SUSHI, ONE_INCH, COMP, BAL, LDO,
     )
 
     // The user's own custom token (symbol + contract address + decimals),

@@ -1,6 +1,13 @@
 package com.neuravex.app.ui
 
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -11,9 +18,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -66,6 +70,7 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
     // "Details" text for diagnosing a failed/partial check.
     var heldAssets by remember { mutableStateOf(configStore.lastHeldAssets) }
     var showBalanceDetails by remember { mutableStateOf(false) }
+    var showSkippedDecisions by remember { mutableStateOf(false) }
     // Fetched alongside `overview` on the same poll cycle, purely to show
     // whether what's on screen is simulated or real — see the badge in
     // the header below. Nothing else on this screen currently branches on
@@ -210,134 +215,149 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
         }
     }
 
+    val botIsHolding = positions.isNotEmpty()
+    val orbMood = when {
+        errorMessage != null -> NeuravexColors.Amber
+        (overview?.drawdown ?: 0.0) >= DRAWDOWN_STOP * 0.7 -> NeuravexColors.Loss
+        botIsHolding -> NeuravexColors.Profit
+        else -> NeuravexColors.VioletGlow
+    }
+
     LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         item {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                androidx.compose.foundation.layout.Column {
-                    Text("NEURAVEX", style = MaterialTheme.typography.headlineMedium, color = NeuravexColors.Silver)
-                    Text("AI Trading. Beyond Human.", color = NeuravexColors.VioletGlow)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text("NEURAVEX", style = MaterialTheme.typography.titleLarge, color = NeuravexColors.Silver, letterSpacing = 4.sp)
                     // Impossible to miss whether real money is at stake —
-                    // deliberately more prominent than a subtitle would
-                    // be, since confusing a simulated loss for a real one
-                    // (or vice versa) is exactly the kind of mistake this
-                    // badge exists to prevent.
-                    Text(
-                        if (paperTradingEnabled) "SIMULATION — no real funds" else "LIVE — real funds",
-                        color = if (paperTradingEnabled) NeuravexColors.SilverDim else NeuravexColors.Loss,
-                        style = MaterialTheme.typography.labelMedium,
-                    )
+                    // confusing a simulated loss for a real one (or vice
+                    // versa) is exactly what this badge exists to prevent.
+                    ModePill(paperTradingEnabled)
                 }
-                TextButton(onClick = onOpenSettings) { Text("Settings") }
+                TextButton(onClick = onOpenSettings) { Text("⚙  Settings", color = NeuravexColors.Silver) }
             }
         }
 
         errorMessage?.let { msg ->
-            item { Text(msg, color = NeuravexColors.Loss) }
+            item {
+                GlassCard(modifier = Modifier.fillMaxWidth(), glow = NeuravexColors.Amber) {
+                    Text(msg, color = NeuravexColors.Amber, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+
+        // `ov.equity` (Polygon) plus the view-only Ethereum-mainnet holdings,
+        // so Portfolio matches a wallet app's total across every network —
+        // see `otherNetworksUsd` above. Both are USD-equivalent; `rate`
+        // converts to euros. Today's P/L stays Polygon-only: it's measured
+        // against a Polygon-only baseline, and Ethereum swings aren't the
+        // AI's doing. A simulation never mixes in anything real, and a live
+        // wallet account's equity already includes Ethereum.
+        val rate = usdToEurRate
+        val backendAlreadyIncludesOtherNetworks =
+            paperTradingEnabled || (executionVenue == "wallet" && !paperTradingEnabled)
+        item {
+            Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                NeuroOrb(mood = orbMood, active = botIsHolding) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("PORTFOLIO", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.labelSmall, letterSpacing = 2.sp)
+                        val ov = overview
+                        if (ov == null) {
+                            Text("…", color = NeuravexColors.Silver, style = MaterialTheme.typography.headlineMedium)
+                        } else {
+                            val portfolioUsd = ov.equity + (if (backendAlreadyIncludesOtherNetworks) 0.0 else otherNetworksUsd)
+                            CountingText(
+                                value = portfolioUsd * (rate ?: 1.0),
+                                format = { (if (rate != null) "€%,.2f" else "$%,.2f").format(it) },
+                                color = NeuravexColors.Silver,
+                                style = MaterialTheme.typography.headlineMedium,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    botThought(errorMessage != null, positions.size, overview?.market_regime, overview?.drawdown ?: 0.0),
+                    color = NeuravexColors.Silver,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                )
+            }
         }
 
         overview?.let { ov ->
-            // `ov.equity` (Polygon) plus the view-only Ethereum-mainnet
-            // holdings, so Portfolio matches a wallet app's total across
-            // every network — see the `otherNetworksUsd` comment above.
-            // Both are USD-equivalent; `rate` converts the whole thing to
-            // euros. Today's P/L is left Polygon-only on purpose: it's
-            // measured against `live_start_equity` (a Polygon-only
-            // baseline), so folding in Ethereum/SHIB price swings would
-            // attribute holdings the AI never touches to its performance.
-            val rate = usdToEurRate
-            // See `executionVenue`'s comment above: don't add Ethereum a
-            // second time when the backend's own `equity` already
-            // includes it.
-            //
-            // BUG FIX: this used to read `executionVenue == "wallet" &&
-            // !paperTradingEnabled` — true only for LIVE wallet accounts —
-            // which meant a SIMULATION account (paperTradingEnabled=true)
-            // always fell through to the `else` branch and added the
-            // REAL Ethereum-mainnet wallet's value on top of the fictional
-            // simulated equity. "SIMULATION — no real funds" was sitting
-            // right above a number that silently included real funds.
-            // Simulation should never mix in anything real, regardless of
-            // venue, so it's excluded outright below.
-            val backendAlreadyIncludesOtherNetworks =
-                paperTradingEnabled || (executionVenue == "wallet" && !paperTradingEnabled)
             item {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    val portfolioUsd = ov.equity + (if (backendAlreadyIncludesOtherNetworks) 0.0 else otherNetworksUsd)
-                    StatCard(
-                        "Portfolio",
-                        if (rate != null) "€%.2f".format(portfolioUsd * rate) else "$%.2f".format(portfolioUsd),
-                        NeuravexColors.Silver,
-                    )
-                    StatCard(
-                        "Today's P/L",
-                        if (rate != null) {
-                            "${if (ov.daily_pnl >= 0) "+" else ""}€%.2f".format(ov.daily_pnl * rate)
-                        } else {
-                            "${if (ov.daily_pnl >= 0) "+" else ""}$%.2f".format(ov.daily_pnl)
-                        },
-                        if (ov.daily_pnl >= 0) NeuravexColors.Profit else NeuravexColors.Loss,
-                    )
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    GlassCard(modifier = Modifier.weight(1f), glow = if (ov.daily_pnl >= 0) NeuravexColors.Profit else NeuravexColors.Loss) {
+                        TileLabel("Today")
+                        CountingText(
+                            value = ov.daily_pnl * (rate ?: 1.0),
+                            format = { "${if (it >= 0) "+" else "-"}${if (rate != null) "€" else "$"}%,.2f".format(kotlin.math.abs(it)) },
+                            color = if (ov.daily_pnl >= 0) NeuravexColors.Profit else NeuravexColors.Loss,
+                        )
+                    }
+                    GlassCard(modifier = Modifier.weight(1f), glow = NeuravexColors.Aurora) {
+                        TileLabel("Market")
+                        Text(friendlyRegime(ov.market_regime), color = NeuravexColors.Silver, style = MaterialTheme.typography.titleMedium)
+                    }
+                }
+            }
+            item {
+                val used = (ov.drawdown / DRAWDOWN_STOP).toFloat()
+                val gaugeColor = when {
+                    used >= 0.7f -> NeuravexColors.Loss
+                    used >= 0.4f -> NeuravexColors.Amber
+                    else -> NeuravexColors.Profit
+                }
+                GlassCard(modifier = Modifier.fillMaxWidth(), glow = gaugeColor) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        ArcGauge(used, gaugeColor, Modifier.size(width = 84.dp, height = 46.dp))
+                        Column {
+                            Text("Down %.1f%% from the peak".format(ov.drawdown * 100), color = NeuravexColors.Silver)
+                            Text(
+                                "The bot sells everything and pauses at %.0f%%.".format(DRAWDOWN_STOP * 100),
+                                color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                 }
             }
             if (!backendAlreadyIncludesOtherNetworks && !otherNetworksComplete && otherNetworkBalances.isNotEmpty()) {
                 item {
                     Text(
                         "Portfolio may be understated — one or more Ethereum-mainnet balances or prices couldn't be read.",
-                        color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall,
+                        color = NeuravexColors.Amber, style = MaterialTheme.typography.bodySmall,
                     )
-                }
-            }
-            item {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    StatCard("Drawdown", "%.1f%%".format(ov.drawdown * 100), NeuravexColors.Silver)
-                    StatCard("Regime", ov.market_regime, NeuravexColors.Silver)
                 }
             }
         }
 
-        // Unified "Tokens" list — everything actually held, across both
-        // networks NEURAVEX can read (Polygon, traded; Ethereum mainnet,
-        // view-only — see WalletHeldAsset's doc in Models.kt), rendered
-        // the way a wallet app like MetaMask shows what you own: one row
-        // per token, icon + name, value + quantity. Replaces the old raw
-        // diagnostic-text dump, which is still available (unabridged, for
-        // debugging a failed/partial check) behind the "Show details"
-        // toggle below.
+        // Everything actually held, the way a wallet app shows it. A real
+        // Ethereum-mainnet holding has no place in a simulation's list. The
+        // raw balance-check text stays behind a toggle for debugging.
         run {
-            // Same reasoning as the Portfolio fix above: a real Ethereum-
-            // mainnet holding has no business in a simulation's Tokens
-            // list, which should show only the fictional positions above.
             val allTokens = (heldAssets + (if (paperTradingEnabled) emptyList() else otherNetworkAssets))
                 .sortedByDescending { it.usdValue }
-            item { Text("Tokens", style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver) }
-            if (allTokens.isEmpty()) {
-                item { Text("No tokens found in the last wallet check yet.", color = NeuravexColors.SilverDim) }
-            } else {
-                item {
-                    Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
-                        androidx.compose.foundation.layout.Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                            allTokens.forEachIndexed { index, asset ->
-                                TokenRow(asset, usdToEurRate)
-                                if (index != allTokens.lastIndex) Divider()
-                            }
-                        }
+            item { SectionTitle("What you hold") }
+            item {
+                GlassCard(modifier = Modifier.fillMaxWidth()) {
+                    if (allTokens.isEmpty()) {
+                        Text("Nothing found in the last wallet check yet.", color = NeuravexColors.SilverDim)
                     }
-                }
-            }
-            balanceDiagnostics?.let { diag ->
-                item {
-                    androidx.compose.foundation.layout.Column {
+                    allTokens.forEach { asset -> TokenRow(asset, usdToEurRate) }
+                    balanceDiagnostics?.let { diag ->
                         TextButton(onClick = { showBalanceDetails = !showBalanceDetails }) {
-                            Text(if (showBalanceDetails) "Hide balance-check details" else "Show balance-check details")
+                            Text(if (showBalanceDetails) "Hide technical details" else "Technical details", color = NeuravexColors.SilverDim)
                         }
                         if (showBalanceDetails) {
-                            androidx.compose.foundation.layout.Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                diag.split("\n").forEach { line ->
-                                    Text(line, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
-                                }
+                            diag.split("\n").forEach { line ->
+                                Text(line, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -345,73 +365,132 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
             }
         }
 
-        item { Divider() }
-
-        item { Text("Open positions", style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver) }
+        item { SectionTitle("Open trades") }
         if (positions.isEmpty()) {
-            item { Text("No open positions — \"no trade\" is a valid decision.", color = NeuravexColors.SilverDim) }
+            item { Text("No open trades — waiting is a valid decision.", color = NeuravexColors.SilverDim) }
         } else {
             items(positions) { pos ->
-                Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
-                    Column2 {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(pos.symbol, color = NeuravexColors.Silver)
-                            Text(pos.side.uppercase(), color = if (pos.side == "buy") NeuravexColors.Profit else NeuravexColors.Loss)
-                        }
-                        Text("Qty ${pos.quantity} @ ${pos.entry_price}", color = NeuravexColors.SilverDim)
+                GlassCard(modifier = Modifier.fillMaxWidth(), glow = if (pos.side == "buy") NeuravexColors.Profit else NeuravexColors.Loss) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(pos.symbol, color = NeuravexColors.Silver, style = MaterialTheme.typography.titleMedium)
+                        Text(pos.side.uppercase(), color = if (pos.side == "buy") NeuravexColors.Profit else NeuravexColors.Loss)
                     }
+                    Text("${formatTokenQuantity(pos.quantity)} @ ${pos.entry_price}", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
 
-        item { Divider() }
+        // Most decisions are "no trade"; those hide behind the switch so the
+        // actual trades don't drown in them. The server keeps them all.
+        val shownDecisions = if (showSkippedDecisions) decisions else decisions.filter { it.executed }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SectionTitle("Why it did what it did")
+                TextButton(onClick = { showSkippedDecisions = !showSkippedDecisions }) {
+                    Text(if (showSkippedDecisions) "Trades only" else "Show all", color = NeuravexColors.VioletGlow)
+                }
+            }
+        }
+        if (shownDecisions.isEmpty()) {
+            item { Text("No trades in the last 24 hours.", color = NeuravexColors.SilverDim) }
+        }
+        items(shownDecisions) { d -> DecisionCard(d) }
 
         if (dailyStats.isNotEmpty()) {
-            item { Text("Daily activity", style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver) }
-            items(dailyStats) { day ->
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(day.date, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
-                    Text(
-                        "${day.executed_count} executed, ${day.skipped_count} skipped",
-                        color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall,
-                    )
+            item { SectionTitle("Daily activity") }
+            item {
+                GlassCard(modifier = Modifier.fillMaxWidth()) {
+                    dailyStats.forEach { day ->
+                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(day.date, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                "${day.executed_count} traded · ${day.skipped_count} skipped",
+                                color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                 }
             }
-            item { Divider() }
         }
+    }
+}
 
-        item {
-            Text(
-                "Why did NEURAVEX decide this? (last 24h — the server keeps every decision permanently for future analysis)",
-                style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver,
-            )
+/** The account's drawdown stop (config/neuravex.yaml, risk.max_drawdown). */
+private const val DRAWDOWN_STOP = 0.10
+
+/** What the bot is up to, in one plain sentence. */
+private fun botThought(offline: Boolean, openTrades: Int, regime: String?, drawdown: Double): String = when {
+    offline -> "I can't reach the server right now. I'll keep trying."
+    drawdown >= DRAWDOWN_STOP -> "Safety stop reached. I've paused buying to protect what's left."
+    openTrades == 1 -> "Holding 1 trade and watching its stop-loss."
+    openTrades > 1 -> "Holding $openTrades trades and watching their stop-losses."
+    regime == "CRASH" -> "The market is crashing. I'm staying out."
+    regime == "BEAR" -> "The market is falling. I'm being picky about buying."
+    regime == null -> "Waking up…"
+    else -> "Watching the market for a good moment to buy."
+}
+
+private fun friendlyRegime(regime: String): String = when (regime) {
+    "STRONG_BULL" -> "Rising fast"
+    "BULL" -> "Rising"
+    "SIDEWAYS" -> "Sideways"
+    "BEAR" -> "Falling"
+    "HIGH_VOLATILITY" -> "Wild swings"
+    "CRASH" -> "Crashing"
+    else -> regime
+}
+
+@Composable
+private fun ModePill(simulation: Boolean) {
+    val color = if (simulation) NeuravexColors.Aurora else NeuravexColors.Loss
+    Text(
+        if (simulation) "SIMULATION · no real funds" else "LIVE · real funds",
+        color = color,
+        style = MaterialTheme.typography.labelMedium,
+        modifier = Modifier
+            .padding(top = 4.dp)
+            .background(color.copy(alpha = 0.14f), RoundedCornerShape(50))
+            .padding(horizontal = 10.dp, vertical = 3.dp),
+    )
+}
+
+@Composable
+private fun SectionTitle(text: String) {
+    Text(text, style = MaterialTheme.typography.titleMedium, color = NeuravexColors.Silver)
+}
+
+@Composable
+private fun TileLabel(text: String) {
+    Text(text, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
+}
+
+@Composable
+private fun DecisionCard(d: DecisionOut) {
+    var expanded by remember { mutableStateOf(false) }
+    val color = when (d.action) {
+        "BUY" -> NeuravexColors.Profit
+        "SELL" -> NeuravexColors.Loss
+        else -> NeuravexColors.SilverDim
+    }
+    GlassCard(
+        modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.animateContentSize(),
+        glow = color,
+    ) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(d.symbol, color = NeuravexColors.Silver, style = MaterialTheme.typography.titleMedium)
+            Text(if (d.action == "NO_TRADE") "WAIT" else d.action, color = color)
         }
-        items(decisions) { d ->
-            Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
-                Column2 {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(d.symbol, color = NeuravexColors.Silver)
-                        Text(
-                            d.action,
-                            color = when (d.action) {
-                                "BUY" -> NeuravexColors.Profit
-                                "SELL" -> NeuravexColors.Loss
-                                else -> NeuravexColors.SilverDim
-                            },
-                        )
-                    }
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(formatDecisionTimestamp(d.created_at), color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
-                        Text(
-                            if (d.executed) "Executed" else "Skipped",
-                            color = if (d.executed) NeuravexColors.Profit else NeuravexColors.SilverDim,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    d.reasons_for.forEach { Text("+ $it", color = NeuravexColors.Profit, style = MaterialTheme.typography.bodySmall) }
-                    d.reasons_against.forEach { Text("- $it", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall) }
-                }
-            }
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(formatDecisionTimestamp(d.created_at), color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
+            Text(if (expanded) "▲" else "why? ▼", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
+        }
+        if (expanded) {
+            d.reasons_for.forEach { Text("+ $it", color = NeuravexColors.Profit, style = MaterialTheme.typography.bodySmall) }
+            d.reasons_against.forEach { Text("- $it", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall) }
         }
     }
 }
@@ -431,21 +510,6 @@ private fun formatDecisionTimestamp(iso: String): String {
     }
 }
 
-@Composable
-private fun Column2(content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
-    androidx.compose.foundation.layout.Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp), content = content)
-}
-
-@Composable
-private fun StatCard(label: String, value: String, valueColor: androidx.compose.ui.graphics.Color) {
-    Card(colors = CardDefaults.cardColors(containerColor = NeuravexColors.SurfaceRaised)) {
-        Column2 {
-            Text(label, color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
-            Text(value, color = valueColor, style = MaterialTheme.typography.headlineSmall)
-        }
-    }
-}
-
 /** One row in the "Tokens" list — icon, symbol + network, value + quantity.
  * The icon has no real per-token logo (NEURAVEX has never needed one
  * before this), so it's a plain monogram circle; good enough to scan a
@@ -453,13 +517,15 @@ private fun StatCard(label: String, value: String, valueColor: androidx.compose.
 @Composable
 private fun TokenRow(asset: WalletHeldAsset, eurRate: Double?) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Box(
-                modifier = Modifier.size(36.dp).background(NeuravexColors.VioletGlow, CircleShape),
+                modifier = Modifier.size(36.dp).background(
+                    Brush.linearGradient(listOf(NeuravexColors.Violet, NeuravexColors.Aurora)), CircleShape,
+                ),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(

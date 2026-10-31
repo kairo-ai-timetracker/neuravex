@@ -10,6 +10,8 @@ object NeuravexColors {
     val SilverDim = Color(0xFF9B98A8)
     val Violet = Color(0xFF7C3AED)
     val VioletGlow = Color(0xFF9D6BFF)
+    val Aurora = Color(0xFF22D3EE)
+    val Amber = Color(0xFFFFB84D)
     val Profit = Color(0xFF2ED9A0)
     val Loss = Color(0xFFFF5C7A)
 }

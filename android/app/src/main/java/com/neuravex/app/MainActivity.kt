@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -15,6 +16,7 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.neuravex.app.data.AppConfigStore
+import com.neuravex.app.ui.CosmicBackground
 import com.neuravex.app.ui.DashboardScreen
 import com.neuravex.app.ui.NeuravexColors
 import com.neuravex.app.ui.OnboardingScreen
@@ -90,18 +92,22 @@ private fun NeuravexNavHost() {
     }
     var screen by remember { mutableStateOf(if (configStore.isOnboarded()) Screen.Dashboard else Screen.Onboarding) }
 
-    when (screen) {
-        Screen.Onboarding -> OnboardingScreen(
-            configStore = configStore,
-            onDone = { screen = Screen.Dashboard },
-        )
-        Screen.Dashboard -> DashboardScreen(
-            configStore = configStore,
-            onOpenSettings = { screen = Screen.Settings },
-        )
-        Screen.Settings -> SettingsScreen(
-            configStore = configStore,
-            onBack = { screen = Screen.Dashboard },
-        )
+    CosmicBackground {
+        Crossfade(targetState = screen, label = "screen") { current ->
+            when (current) {
+                Screen.Onboarding -> OnboardingScreen(
+                    configStore = configStore,
+                    onDone = { screen = Screen.Dashboard },
+                )
+                Screen.Dashboard -> DashboardScreen(
+                    configStore = configStore,
+                    onOpenSettings = { screen = Screen.Settings },
+                )
+                Screen.Settings -> SettingsScreen(
+                    configStore = configStore,
+                    onBack = { screen = Screen.Dashboard },
+                )
+            }
+        }
     }
 }

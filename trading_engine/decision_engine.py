@@ -55,6 +55,9 @@ class Decision:
     # save_decision() so "X executed / Y skipped today" reflects what
     # really happened, not just what the AI wanted to do.
     executed: bool = False
+    # The symbol's market regime when this was decided; the supervisor
+    # judges strategies per regime.
+    entry_regime: str | None = None
 
 
 _REGIME_SCORE = {

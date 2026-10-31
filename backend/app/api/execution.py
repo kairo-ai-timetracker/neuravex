@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.api.auth import require_account_owner
 from backend.app.db.session import get_db
-from backend.app.db.sql_data_store import apply_strategy_result
+from backend.app.db.sql_data_store import apply_strategy_result, record_closed_trade
 from backend.app.models import models as m
 
 router = APIRouter(prefix="/api/execution", tags=["execution"])
@@ -209,3 +209,4 @@ def _update_strategy_performance(db: Session, position: m.Position, quantity_clo
     won = position.realized_pnl > 0
 
     apply_strategy_result(db, opening_decision.contributing_strategies, won=won, pnl_per_unit=pnl_per_unit)
+    record_closed_trade(db, position.account_id, opening_decision, position.realized_pnl, simulated=False)

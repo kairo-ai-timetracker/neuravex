@@ -44,6 +44,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from trading_engine.supervisor import ClosedTrade as SupervisorTrade
 from trading_engine.agent import AgentConfig, NeuravexAgent  # noqa: E402
 from trading_engine.decision_engine import Decision, ScoreBreakdown  # noqa: E402
 from trading_engine.execution.exchange_interface import Candle, OrderType, Side  # noqa: E402
@@ -101,7 +102,14 @@ def fetch_5m(symbol: str, start: int, end: int, cache_dir: Path) -> np.ndarray:
     # Write-then-rename, so parallel runs never see (or clash on) a half-written file.
     tmp = cache.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data))
-    os.replace(tmp, cache)
+    try:
+        os.replace(tmp, cache)
+    except PermissionError:
+        # Windows: a parallel run has the same cache file open — it holds
+        # the same data, so this copy can simply be dropped.
+        if not cache.exists():
+            raise
+        tmp.unlink(missing_ok=True)
     return np.array(data)
 
 
@@ -201,6 +209,8 @@ class ReplayStore:
         self.day_start_equity: dict = {}
         self.risk_events = Counter()
         self.buy_strategies: dict[str, list[str]] = {}
+        self.buy_regimes: dict[str, str | None] = {}
+        self.closed_trades: list[SupervisorTrade] = []
         self.strategy_stats: dict[str, list] = defaultdict(lambda: [0.0, 0.0, 0])
 
     def equity(self) -> float:
@@ -226,6 +236,7 @@ class ReplayStore:
             self.exec_log.append((self.now, decision.symbol, decision.action))
             if decision.action == "BUY":
                 self.buy_strategies[decision.symbol] = [s.strategy_name for s in decision.contributing_signals]
+                self.buy_regimes[decision.symbol] = decision.entry_regime
         return decision.id
 
     def save_order_result(self, order_result, decision_id, account_id):
@@ -266,9 +277,13 @@ class ReplayStore:
         names = self.buy_strategies.get(symbol) or []
         qty = order_result.filled_quantity
         realized = (order_result.average_fill_price - entry_price) * qty - order_result.fee
+        self.closed_trades.append(SupervisorTrade(self.now, realized, names, self.buy_regimes.get(symbol)))
         for name in names:
             wr, exp, n = self.strategy_stats[name]
             self.strategy_stats[name] = list(update_running_stats(wr, exp, n, won=realized > 0, pnl_per_unit=realized / qty))
+
+    def recent_closed_trades(self, account_id):
+        return self.closed_trades
 
     def strategy_performance(self) -> dict[str, float]:
         out = {}
@@ -372,6 +387,8 @@ async def replay(args) -> dict:
         estimated_transaction_cost=0.003 if new else 0.001,
         timeframe=args.timeframe, min_agreeing_strategies=args.min_agree,
         entry_regimes=tuple(args.entry_regimes) if args.entry_regimes else None,
+        timeframe_aware_regime=not args.legacy_regime,
+        supervisor_enabled=args.supervisor,
     )
     strategies = [TrendFollowingStrategy(), MomentumStrategy(), MeanReversionStrategy(), BreakoutStrategy()]
     agent = NeuravexAgent(exchange=exchange, strategies=strategies, store=store, config=config,
@@ -466,6 +483,8 @@ def main():
     ap.add_argument("--min-agree", type=int, default=1, help="strategies that must agree on an entry")
     ap.add_argument("--entry-regimes", nargs="+", help="e.g. BULL STRONG_BULL")
     ap.add_argument("--label", help="free text echoed in the result")
+    ap.add_argument("--supervisor", action="store_true", help="feedback layer: stake and strategy gate")
+    ap.add_argument("--legacy-regime", action="store_true", help="old 1h volatility/crash assumptions on any timeframe")
     args = ap.parse_args()
     args.take_profit = args.take_profit or None
     print(json.dumps(asyncio.run(replay(args)), indent=2))

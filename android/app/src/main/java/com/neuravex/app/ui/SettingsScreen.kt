@@ -55,6 +55,8 @@ import kotlinx.coroutines.launch
  * LazyColumn for the coin checkboxes) — nesting a scrollable list inside
  * another scrollable container is a common Compose crash/layout bug.
  */
+private const val COIN_DEFAULTS_VERSION = 1
+
 @Composable
 fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -156,6 +158,16 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
                         persist(AccountSettingsUpdate(execution_venue = "wallet", symbols = emptyList())) { _, _ -> }
                     }
                     selectedCoins = s.symbols.toSet()
+                    // Every coin starts switched on and the user switches off
+                    // what they don't want. Done once per list version, so a
+                    // later choice to switch a coin off stays off.
+                    if (venue == "wallet" && configStore.coinDefaultsVersion < COIN_DEFAULTS_VERSION) {
+                        val all = SupportedPolygonCoins.ALL.toSet()
+                        selectedCoins = all
+                        persist(AccountSettingsUpdate(symbols = all.toList())) { success, _ ->
+                            if (success) configStore.coinDefaultsVersion = COIN_DEFAULTS_VERSION
+                        }
+                    }
                     balanceFloorText = s.min_balance_floor?.let { "%.0f".format(it) } ?: ""
                     profitTargetText = s.max_balance_target?.let { "%.0f".format(it) } ?: ""
                     aiEnabled = s.ai_enabled
@@ -366,23 +378,16 @@ fun SettingsScreen(configStore: AppConfigStore, onBack: () -> Unit) {
 
         // --- 3. Coins ---
         item {
-            Text("Which coins can the AI trade?", color = NeuravexColors.Silver)
-        }
-        items(coinOptions) { coin ->
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Checkbox(
-                    checked = coin in selectedCoins,
-                    onCheckedChange = { checked ->
-                        val updated = if (checked) selectedCoins + coin else selectedCoins - coin
-                        selectedCoins = updated
-                        persist(AccountSettingsUpdate(symbols = updated.toList())) { _, _ -> }
-                    },
-                )
-                Text(coin, color = NeuravexColors.Silver)
-            }
+            CoinTiles(
+                coins = coinOptions,
+                selected = selectedCoins,
+                onChange = { updated ->
+                    selectedCoins = updated
+                    persist(AccountSettingsUpdate(symbols = updated.toList())) { _, error ->
+                        if (error != null) statusMessage = error
+                    }
+                },
+            )
         }
 
         // --- 3b. Custom token (wallet venue only — a CEX pair needs no

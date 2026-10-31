@@ -348,6 +348,8 @@ def _build_agent_for_account(
         allow_live_flag=global_settings.allow_live,
         execution_mode=execution_mode,
         dry_run=not account_settings.ai_enabled,
+        analysis_log_window_seconds=300,
+        supervisor_enabled=True,
     )
     agent = NeuravexAgent(
         exchange=exchange, strategies=strategies, store=store,

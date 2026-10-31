@@ -17,6 +17,7 @@ from trading_engine.execution.exchange_interface import Exchange, OrderType, Sid
 from trading_engine.execution.live_guard import assert_live_order_allowed
 from trading_engine.regime.regime_detector import detect_regime
 from trading_engine.risk.position_sizing import calculate_position_size
+from trading_engine.supervisor import ClosedTrade, SupervisorVerdict, evaluate_supervisor
 from trading_engine.risk.risk_engine import (
     PortfolioState,
     RiskLimitBreach,
@@ -56,6 +57,7 @@ class PlannedOrder:
 
 class DataStore(Protocol):
     def save_signal(self, symbol: str, signal) -> None: ...
+    def recent_closed_trades(self, account_id: str) -> list[ClosedTrade]: ...
     def save_decision(self, decision: Decision, account_id: str) -> str: ...
     def save_order_result(self, order_result, decision_id: str | None, account_id: str) -> None: ...
     def save_risk_event(self, event_type: str, severity: str, message: str, context: dict) -> None: ...
@@ -129,6 +131,22 @@ class AgentConfig:
     # If set, only open new positions while the symbol's market regime is
     # one of these (MarketRegime values, e.g. ("BULL", "STRONG_BULL")).
     entry_regimes: tuple[str, ...] | None = None
+    # detect_regime() was written for 1h candles: it annualizes volatility
+    # with 24*365 periods and looks back 24 candles for a crash. On 4h
+    # candles that overstated volatility ~2x (nearly every coin read as
+    # "high", which penalized every score and switched mean reversion off)
+    # and stretched the crash window to 4 days. True scales both to the
+    # configured timeframe; False keeps the old 1h assumption.
+    # Off by default: in the replay (Aug-Oct 2026) the correct numbers did
+    # worse (+0.1% vs +8.2%) because mean reversion trades more.
+    timeframe_aware_regime: bool = False
+    # If set, NO_TRADE decisions and signals are only stored during this many
+    # seconds after a candle closes. On closed candles they are identical for
+    # the rest of the candle, and a tick per minute wrote ~1,440 rows per coin
+    # per day. Real trades are always stored.
+    analysis_log_window_seconds: int | None = None
+    # See trading_engine/supervisor.py.
+    supervisor_enabled: bool = False
 
 
 class NeuravexAgent:
@@ -153,6 +171,9 @@ class NeuravexAgent:
         # Naive-UTC "now", injectable so scripts/replay_backtest.py can
         # replay history through this exact code path.
         self._now = clock or datetime.utcnow
+        # Symbols past analysis_log_window_seconds on this tick.
+        self._quiet_symbols: set[str] = set()
+        self._verdict = SupervisorVerdict()
 
     async def run_tick(self) -> list[Decision]:
         decisions: list[Decision] = []
@@ -198,12 +219,14 @@ class NeuravexAgent:
                 )
             return decisions
 
+        self._verdict = self._load_supervisor_verdict()
         for symbol in self.config.symbols:
             try:
                 decision = await self._process_symbol(symbol, state)
                 if decision is not None:
                     decisions.append(decision)
-                    self.store.save_decision(decision, self.account_id)
+                    if decision.action != "NO_TRADE" or symbol not in self._quiet_symbols:
+                        self.store.save_decision(decision, self.account_id)
             except Exception as e:  # noqa: BLE001 — one bad symbol must not kill the whole tick
                 logger.exception("Error processing %s: %s", symbol, e)
                 self.store.save_risk_event("symbol_processing_failed", "warning", str(e), {"symbol": symbol})
@@ -231,14 +254,21 @@ class NeuravexAgent:
             close=np.array([c.close for c in candles]),
             volume=np.array([c.volume for c in candles]),
         )
-        regime = detect_regime(data.high, data.low, data.close)
+        regime = detect_regime(data.high, data.low, data.close, **self._regime_params())
+
+        window = self.config.analysis_log_window_seconds
+        if window is not None and (self._now() - self._candle_close_time(candles[-1])).total_seconds() > window:
+            self._quiet_symbols.add(symbol)
+        else:
+            self._quiet_symbols.discard(symbol)
 
         signals = []
         for strategy in self.strategies:
             signal = strategy.generate_signal(symbol, data, regime)
             if signal is not None:
                 signals.append(signal)
-                self.store.save_signal(symbol, signal)
+                if symbol not in self._quiet_symbols:
+                    self.store.save_signal(symbol, signal)
 
         correlated = self.correlation_matrix.get(symbol, {})
         correlation_penalty = max(
@@ -257,6 +287,8 @@ class NeuravexAgent:
             minimum_confidence=self.config.minimum_confidence,
             minimum_expected_edge=self.config.minimum_expected_edge,
         )
+
+        decision.entry_regime = regime.market_regime.value
 
         if decision.action == "NO_TRADE":
             return decision
@@ -351,6 +383,17 @@ class NeuravexAgent:
                 )
                 return decision
 
+            allowed = [
+                s for s in decision.contributing_signals
+                if self._verdict.allows(s.strategy_name, regime.market_regime.value)
+            ]
+            if not allowed:
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append(
+                    f"Supervisor: these strategies recently lost money in {regime.market_regime.value}"
+                )
+                return decision
+
         entry = current_price
         atr_value = float(atr(data.high, data.low, data.close)[-1])
         plan = build_risk_plan(entry=entry, direction=direction, atr_value=atr_value)
@@ -403,7 +446,8 @@ class NeuravexAgent:
         )
         size = calculate_position_size(
             account_equity=state.equity, entry_price=entry, stop_loss_price=plan.stop_loss,
-            confidence=decision.confidence, max_trade_risk=self.config.max_trade_risk,
+            confidence=decision.confidence,
+            max_trade_risk=self.config.max_trade_risk * self._verdict.risk_multiplier,
             max_position_size_fraction=self.config.max_position_size,
             current_portfolio_exposure_fraction=current_exposure_fraction,
             max_portfolio_exposure_fraction=self.config.max_portfolio_exposure,
@@ -643,6 +687,26 @@ class NeuravexAgent:
         if seconds is None:
             raise ValueError(f"Unknown timeframe {self.config.timeframe!r}")
         return seconds
+
+    def _load_supervisor_verdict(self) -> SupervisorVerdict:
+        if not self.config.supervisor_enabled:
+            return SupervisorVerdict()
+        try:
+            return evaluate_supervisor(self.store.recent_closed_trades(self.account_id), self._now())
+        except Exception as e:  # noqa: BLE001 — trading continues on the unmodified rules
+            logger.exception("Supervisor could not evaluate: %s", e)
+            return SupervisorVerdict()
+
+    def _regime_params(self) -> dict:
+        """detect_regime() arguments for the configured candle size; see
+        AgentConfig.timeframe_aware_regime."""
+        if not self.config.timeframe_aware_regime:
+            return {}
+        hours = self._timeframe_seconds() / 3600
+        return {
+            "periods_per_year": round(365 * 24 / hours),
+            "crash_window": max(1, round(24 / hours)),
+        }
 
     def _candle_close_time(self, candle) -> datetime:
         return _as_naive_utc(candle.open_time) + timedelta(seconds=self._timeframe_seconds())

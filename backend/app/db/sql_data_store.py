@@ -15,6 +15,7 @@ from backend.app.models import models as m
 from trading_engine.decision_engine import Decision
 from trading_engine.risk.risk_engine import DRAWDOWN_HALT_COOLDOWN, PortfolioState
 from trading_engine.strategies.performance import update_running_stats
+from trading_engine.supervisor import LOOKBACK, ClosedTrade
 
 
 def apply_strategy_result(session: Session, strategy_names: list[str], *, won: bool, pnl_per_unit: float) -> None:
@@ -31,6 +32,22 @@ def apply_strategy_result(session: Session, strategy_names: list[str], *, won: b
             strategy.historical_win_rate or 0.0, strategy.historical_expectancy or 0.0,
             strategy.closed_trades_count or 0, won=won, pnl_per_unit=pnl_per_unit,
         )
+
+
+def record_closed_trade(session: Session, account_id: str, opening: m.AIDecision, pnl: float, *, simulated: bool) -> None:
+    """One line of history for the supervisor (trading_engine/supervisor.py).
+    Shared by the live path (execution.py) and SqlDataStore.record_realized_trade."""
+    session.add(m.RiskEvent(
+        account_id=account_id,
+        event_type="closed_trade_sim" if simulated else "closed_trade_live",
+        severity="info",
+        message=f"{opening.symbol} closed at {pnl:+.2f}",
+        context={
+            "pnl": float(pnl),
+            "strategies": opening.contributing_strategies or [],
+            "regime": (opening.score_breakdown or {}).get("entry_regime"),
+        },
+    ))
 
 
 def _json_safe(value):
@@ -198,7 +215,9 @@ class SqlDataStore:
             # decision_engine.score_signals(), and unlike the JSON columns
             # below, this one was NOT covered by the earlier numpy fix.
             final_score=_json_safe(decision.score.final_score) if decision.score else 0.0,
-            score_breakdown=_json_safe(vars(decision.score)) if decision.score else {},
+            score_breakdown=(
+                {**_json_safe(vars(decision.score)), "entry_regime": decision.entry_regime} if decision.score else {}
+            ),
             reasons_for=decision.reasons_for, reasons_against=decision.reasons_against,
             contributing_strategies=[s.strategy_name for s in decision.contributing_signals],
             executed=decision.executed,
@@ -368,6 +387,25 @@ class SqlDataStore:
         # subtract the sell fee too, so a "win" is a win after costs.
         realized = (order_result.average_fill_price - entry_price) * qty - (order_result.fee or 0.0)
         apply_strategy_result(self.session, opening.contributing_strategies, won=realized > 0, pnl_per_unit=realized / qty)
+        record_closed_trade(self.session, account_id, opening, realized, simulated=True)
+
+    def recent_closed_trades(self, account_id: str) -> list[ClosedTrade]:
+        rows = (
+            self.session.query(m.RiskEvent)
+            .filter(
+                m.RiskEvent.account_id == account_id,
+                m.RiskEvent.event_type == ("closed_trade_sim" if self.simulated else "closed_trade_live"),
+                m.RiskEvent.created_at >= datetime.utcnow() - LOOKBACK,
+            )
+            .all()
+        )
+        return [
+            ClosedTrade(
+                closed_at=row.created_at, pnl=row.context.get("pnl", 0.0),
+                strategies=row.context.get("strategies") or [], regime=row.context.get("regime"),
+            )
+            for row in rows
+        ]
 
     def expire_stale_pending_executions(self, account_id: str) -> int:
         """
