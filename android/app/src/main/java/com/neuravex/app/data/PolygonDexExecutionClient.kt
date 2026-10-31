@@ -51,7 +51,8 @@ class PolygonDexExecutionClient(
 
     val walletAddress: String get() = credentials.address
 
-    suspend fun swap(pairSymbol: String, side: String, quantity: Double): ExecutionResult = withContext(Dispatchers.IO) {
+    /** [referencePrice] is the market price in USDC per coin; see PriceGuard. */
+    suspend fun swap(pairSymbol: String, side: String, quantity: Double, referencePrice: Double? = null): ExecutionResult = withContext(Dispatchers.IO) {
         try {
             val pair = PolygonTokenRegistry.parsePair(pairSymbol)
                 ?: return@withContext ExecutionResult(success = false, errorMessage = "Unknown or unverified token pair: $pairSymbol")
@@ -66,8 +67,8 @@ class PolygonDexExecutionClient(
             }
 
             when (side.lowercase()) {
-                "buy" -> executeExactOutput(tokenIn = quote, tokenOut = base, amountOutHuman = quantity, gasPrice = gasPrice)
-                "sell" -> executeExactInput(tokenIn = base, tokenOut = quote, amountInHuman = quantity, gasPrice = gasPrice)
+                "buy" -> executeExactOutput(tokenIn = quote, tokenOut = base, amountOutHuman = quantity, gasPrice = gasPrice, referencePrice = referencePrice)
+                "sell" -> executeExactInput(tokenIn = base, tokenOut = quote, amountInHuman = quantity, gasPrice = gasPrice, referencePrice = referencePrice)
                 else -> ExecutionResult(success = false, errorMessage = "Unknown side: $side")
             }
         } catch (e: Exception) {
@@ -80,6 +81,7 @@ class PolygonDexExecutionClient(
         tokenOut: PolygonTokenRegistry.Token,
         amountInHuman: Double,
         gasPrice: BigInteger,
+        referencePrice: Double?,
     ): ExecutionResult {
         val amountIn = toRawAmount(amountInHuman, tokenIn.decimals)
 
@@ -94,6 +96,9 @@ class PolygonDexExecutionClient(
         val hops = PolygonRoutes.between(tokenIn, tokenOut)
         val quotedAmountOut = quoteIn(hops, amountIn)
             ?: return ExecutionResult(success = false, errorMessage = "No quote available for ${tokenIn.symbol}/${tokenOut.symbol} — pool may lack liquidity")
+        PriceGuard.refusal(
+            "sell", fromRawAmount(quotedAmountOut, tokenOut.decimals).toDouble() / amountInHuman, referencePrice,
+        )?.let { return ExecutionResult(success = false, errorMessage = it) }
         val amountOutMinimum = applySlippage(quotedAmountOut, reduce = true)
 
         ensureApproval(tokenIn.address, amountIn, gasPrice)?.let { return it }
@@ -132,12 +137,16 @@ class PolygonDexExecutionClient(
         tokenOut: PolygonTokenRegistry.Token,
         amountOutHuman: Double,
         gasPrice: BigInteger,
+        referencePrice: Double?,
     ): ExecutionResult {
         val amountOut = toRawAmount(amountOutHuman, tokenOut.decimals)
 
         val hops = PolygonRoutes.between(tokenIn, tokenOut)
         val quotedAmountIn = quoteOut(hops, amountOut)
             ?: return ExecutionResult(success = false, errorMessage = "No quote available for ${tokenIn.symbol}/${tokenOut.symbol} — pool may lack liquidity")
+        PriceGuard.refusal(
+            "buy", fromRawAmount(quotedAmountIn, tokenIn.decimals).toDouble() / amountOutHuman, referencePrice,
+        )?.let { return ExecutionResult(success = false, errorMessage = it) }
         val amountInMaximum = applySlippage(quotedAmountIn, reduce = false)
 
         val balance = erc20BalanceOf(tokenIn.address)

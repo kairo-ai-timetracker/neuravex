@@ -9,6 +9,7 @@ from backend.app.core.config import settings as global_settings
 from backend.app.db.session import get_session
 from backend.app.db.sql_data_store import SqlDataStore
 from backend.app.models import models as m
+from trading_engine.execution.route_costs import ROUND_TRIP_COST, slippage_bps_by_symbol
 from trading_engine.agent import AgentConfig, NeuravexAgent, PlannedOrder
 from trading_engine.decision_engine import Decision, ScoreBreakdown
 from trading_engine.execution.exchange_interface import OrderType, Side
@@ -134,6 +135,7 @@ async def _build_paper_exchange(
     # time a later symbol's trade tried to execute against it.
     paper = PaperExchange(
         starting_balances=starting_balances, max_price_age_seconds=180,
+        slippage_bps_by_symbol=slippage_bps_by_symbol(),
         starting_cost_basis=starting_cost_basis,
     )
     last_prices: dict[str, float] = {}
@@ -307,10 +309,12 @@ def _build_agent_for_account(
         # symbol_processing_failed events, every one a wasted analysis.
         # Simulation trades the USDC pairs only; the USDT ones remain in
         # the user's list for live use.
-        trade_symbols = [sym for sym in (account_settings.symbols or []) if sym.endswith("/USDC")]
+        # Only coins with a real swap route: anything else would show
+        # simulated results that could never happen on-chain.
+        trade_symbols = [sym for sym in (account_settings.symbols or []) if sym in ROUND_TRIP_COST]
         skipped = sorted(set(account_settings.symbols or []) - set(trade_symbols))
         if skipped:
-            logger.info("Account %s SIMULATION: skipping non-USDC pairs %s", account.id, skipped)
+            logger.info("Account %s SIMULATION: skipping pairs without a route %s", account.id, skipped)
         # Previously forced to None here on the reasoning that
         # "the floor governs real money" — but the Settings screen
         # shows this as a plain "stop trading when my balance
@@ -350,6 +354,7 @@ def _build_agent_for_account(
         dry_run=not account_settings.ai_enabled,
         analysis_log_window_seconds=300,
         supervisor_enabled=True,
+        round_trip_cost_by_symbol=ROUND_TRIP_COST,
     )
     agent = NeuravexAgent(
         exchange=exchange, strategies=strategies, store=store,
@@ -584,7 +589,7 @@ def check_live_exits() -> str:
                 store.save_pending_execution(
                     account.id, None,
                     PlannedOrder(
-                        symbol=position.symbol, side="sell", quantity=position.quantity,
+                        symbol=position.symbol, side="sell", quantity=position.quantity, limit_price=ticker.bid,
                         stop_loss=0.0, take_profit_1=0.0, take_profit_2=0.0, confidence=1.0,
                         reasons_for=[reason_text], reasons_against=[],
                     ),

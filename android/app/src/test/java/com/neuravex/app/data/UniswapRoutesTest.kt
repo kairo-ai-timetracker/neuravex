@@ -73,4 +73,21 @@ class UniswapRoutesTest {
         assertTrue(UniswapEncoding.encode(UniswapEncoding.quoterCall("quoteExactInput", path, BigInteger.ONE)).startsWith("0xcdca1753"))
         assertTrue(UniswapEncoding.encode(UniswapEncoding.quoterCall("quoteExactOutput", path, BigInteger.ONE)).startsWith("0x2f80bb1d"))
     }
+
+    @Test
+    fun `price guard refuses a bad quote in either direction`() {
+        assertTrue(PriceGuard.refusal("buy", 106.0, 100.0) != null)
+        assertTrue(PriceGuard.refusal("sell", 94.0, 100.0) != null)
+        assertEquals(null, PriceGuard.refusal("buy", 104.0, 100.0))
+        assertEquals(null, PriceGuard.refusal("sell", 96.0, 100.0))
+        // A better price than the market is never a reason to refuse.
+        assertEquals(null, PriceGuard.refusal("buy", 80.0, 100.0))
+        assertEquals(null, PriceGuard.refusal("sell", 120.0, 100.0))
+    }
+
+    @Test
+    fun `without a market price buys stop but sells continue`() {
+        assertTrue(PriceGuard.refusal("buy", 100.0, null) != null)
+        assertEquals(null, PriceGuard.refusal("sell", 100.0, null))
+    }
 }

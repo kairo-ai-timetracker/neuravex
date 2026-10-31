@@ -90,7 +90,7 @@ class ExecutionRepository(private val api: NeuravexApi, private val accountId: S
             return ExecutionOutcome.Skipped(item.symbol, "Not claimed (HTTP ${claim.code()}) — already handled or expired")
         }
 
-        val result = client.swap(item.symbol, item.side, item.quantity)
+        val result = client.swap(item.symbol, item.side, item.quantity, item.limit_price)
 
         return if (result.success) {
             // For a BUY, amountIn is the quote asset spent (USDC) and

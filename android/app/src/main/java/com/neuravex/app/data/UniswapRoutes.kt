@@ -86,3 +86,27 @@ object UniswapEncoding {
 
     fun encode(function: Function): String = FunctionEncoder.encode(function)
 }
+
+/**
+ * Last check before a swap: the on-chain quote must be close to the market price
+ * the bot decided on. The swap's slippage limit only protects against movement
+ * after the quote, so a thin pool quoting a terrible price would otherwise go
+ * through. A buy without a market price is refused; a sell without one goes
+ * ahead, because a failed price lookup must not trap a position.
+ */
+object PriceGuard {
+    const val MAX_DEVIATION = 0.05
+
+    /** The reason to refuse, or null if the swap may go ahead. */
+    fun refusal(side: String, quotedPrice: Double, marketPrice: Double?): String? {
+        if (marketPrice == null || marketPrice <= 0.0) {
+            return if (side == "buy") "Buy refused: no market price to check the quote against" else null
+        }
+        val tooFar = if (side == "buy") {
+            quotedPrice > marketPrice * (1 + MAX_DEVIATION)
+        } else {
+            quotedPrice < marketPrice * (1 - MAX_DEVIATION)
+        }
+        return if (tooFar) "${side.replaceFirstChar { it.uppercase() }} refused: pool quotes $quotedPrice, market is $marketPrice" else null
+    }
+}

@@ -44,6 +44,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from trading_engine.execution.route_costs import ROUND_TRIP_COST, slippage_bps_by_symbol
 from trading_engine.supervisor import ClosedTrade as SupervisorTrade
 from trading_engine.agent import AgentConfig, NeuravexAgent  # noqa: E402
 from trading_engine.decision_engine import Decision, ScoreBreakdown  # noqa: E402
@@ -374,7 +375,10 @@ async def replay(args) -> dict:
         else:
             print(f"  (no data for {sym}, skipped)", file=sys.stderr)
 
-    exchange = ReplayExchange(starting_balances={"USDC": args.equity}, max_price_age_seconds=10**9)
+    exchange = ReplayExchange(
+        starting_balances={"USDC": args.equity}, max_price_age_seconds=10**9,
+        slippage_bps_by_symbol=slippage_bps_by_symbol() if args.real_costs else None,
+    )
     store = ReplayStore(exchange, args.mode)
     sim_now = {"t": datetime.fromtimestamp(start, tz=timezone.utc).replace(tzinfo=None)}
     new = args.mode == "new"
@@ -389,6 +393,7 @@ async def replay(args) -> dict:
         entry_regimes=tuple(args.entry_regimes) if args.entry_regimes else None,
         timeframe_aware_regime=not args.legacy_regime,
         supervisor_enabled=args.supervisor,
+        round_trip_cost_by_symbol=ROUND_TRIP_COST if args.real_costs else None,
     )
     strategies = [TrendFollowingStrategy(), MomentumStrategy(), MeanReversionStrategy(), BreakoutStrategy()]
     agent = NeuravexAgent(exchange=exchange, strategies=strategies, store=store, config=config,
@@ -483,6 +488,7 @@ def main():
     ap.add_argument("--min-agree", type=int, default=1, help="strategies that must agree on an entry")
     ap.add_argument("--entry-regimes", nargs="+", help="e.g. BULL STRONG_BULL")
     ap.add_argument("--label", help="free text echoed in the result")
+    ap.add_argument("--real-costs", action="store_true", help="measured on-chain cost per coin")
     ap.add_argument("--supervisor", action="store_true", help="feedback layer: stake and strategy gate")
     ap.add_argument("--legacy-regime", action="store_true", help="old 1h volatility/crash assumptions on any timeframe")
     args = ap.parse_args()

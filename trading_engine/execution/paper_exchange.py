@@ -35,6 +35,7 @@ class PaperExchange(Exchange):
         taker_fee: float = 0.001,
         maker_fee: float = 0.0008,
         slippage_bps: float = 5.0,
+        slippage_bps_by_symbol: dict[str, float] | None = None,
         max_price_age_seconds: int = 30,
         starting_cost_basis: dict[str, float] | None = None,
     ):
@@ -53,6 +54,7 @@ class PaperExchange(Exchange):
         self.taker_fee = taker_fee
         self.maker_fee = maker_fee
         self.slippage_bps = slippage_bps
+        self.slippage_bps_by_symbol = slippage_bps_by_symbol or {}
         self.max_price_age_seconds = max_price_age_seconds
 
     def get_cost_basis(self) -> dict[str, float]:
@@ -112,7 +114,7 @@ class PaperExchange(Exchange):
         base, quote = symbol.split("/")
 
         fill_price = price if order_type == OrderType.limit and price else last_price
-        slip = fill_price * (self.slippage_bps / 10_000.0)
+        slip = fill_price * (self.slippage_bps_by_symbol.get(symbol, self.slippage_bps) / 10_000.0)
         fill_price = fill_price + slip if side == Side.buy else fill_price - slip
 
         notional = fill_price * quantity

@@ -123,6 +123,8 @@ class AgentConfig:
     # beat it). Was hardcoded to 0.1%; the real paper/CEX round trip is
     # ~0.3% (2 x 0.1% taker fee + 2 x 5 bps slippage).
     estimated_transaction_cost: float = 0.003
+    # Measured round-trip cost per symbol, overriding the estimate above.
+    round_trip_cost_by_symbol: dict[str, float] | None = None
     # Entry filters (new positions only — exits are never filtered). The
     # defaults keep the original behaviour; see scripts/replay_backtest.py
     # for how alternatives are evaluated before being switched on.
@@ -283,7 +285,9 @@ class NeuravexAgent:
             strategy_performance=self.strategy_performance,
             volume_confirmation_score=volume_confirmation,
             correlation_penalty=correlation_penalty,
-            estimated_transaction_cost=self.config.estimated_transaction_cost,
+            estimated_transaction_cost=(self.config.round_trip_cost_by_symbol or {}).get(
+                symbol, self.config.estimated_transaction_cost
+            ),
             minimum_confidence=self.config.minimum_confidence,
             minimum_expected_edge=self.config.minimum_expected_edge,
         )
@@ -492,6 +496,7 @@ class NeuravexAgent:
             # phone to execute with its own locally-held API key.
             planned = PlannedOrder(
                 symbol=symbol, side="buy" if direction == "LONG" else "sell", quantity=size.quantity,
+                limit_price=entry,  # the phone refuses a swap far from this price
                 stop_loss=plan.stop_loss, take_profit_1=plan.take_profit_1, take_profit_2=plan.take_profit_2,
                 confidence=decision.confidence, reasons_for=decision.reasons_for, reasons_against=decision.reasons_against,
             )
@@ -608,6 +613,7 @@ class NeuravexAgent:
         if self.config.execution_mode == "phone":
             planned = PlannedOrder(
                 symbol=symbol, side="sell", quantity=quantity,
+                limit_price=await self._reference_price(symbol),
                 # No stop_loss/take_profit_1/2 on a close — those describe
                 # a NEW position's risk plan, which doesn't apply here.
                 stop_loss=0.0, take_profit_1=0.0, take_profit_2=0.0,
@@ -687,6 +693,15 @@ class NeuravexAgent:
         if seconds is None:
             raise ValueError(f"Unknown timeframe {self.config.timeframe!r}")
         return seconds
+
+    async def _reference_price(self, symbol: str) -> float | None:
+        """Market price for the phone's price check. None skips that check,
+        since a failed lookup must not stop a position from being closed."""
+        try:
+            return float((await self.exchange.get_ticker(symbol)).bid)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("No reference price for %s: %s", symbol, e)
+            return None
 
     def _load_supervisor_verdict(self) -> SupervisorVerdict:
         if not self.config.supervisor_enabled:
