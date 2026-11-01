@@ -66,7 +66,7 @@ fun PortfolioHome(
                         portfolios = response.body().orEmpty()
                         loadError = null
                     } else {
-                        loadError = "Could not load the Metals and Stocks tabs (HTTP ${response.code()})"
+                        loadError = "Could not load the Metals and Stocks tabs (HTTP ${response.code()}): ${response.errorBody()?.string()}"
                     }
                 }
                 returns = portfolios.mapNotNull { p ->

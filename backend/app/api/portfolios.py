@@ -5,9 +5,10 @@ and stocks are simulation only (see market_universe.py).
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -15,6 +16,8 @@ from backend.app.api.auth import require_account_owner
 from backend.app.db.session import get_db
 from backend.app.models import models as m
 from trading_engine.execution.market_universe import METALS, STOCKS, TICKERS_BY_MARKET, symbols_for
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/portfolios", tags=["portfolios"])
 
@@ -43,9 +46,11 @@ def _portfolio_out(market: str, account: m.Account) -> PortfolioOut:
 def ensure_portfolios(db: Session, account: m.Account) -> list[PortfolioOut]:
     """Creates any missing market portfolio, starting from the crypto
     portfolio's amount and stop so the results can be compared fairly."""
-    accounts = db.query(m.Account).filter_by(user_id=account.user_id).order_by(m.Account.created_at).all()
+    # str() on ids used as parameters: psycopg2 can't bind a uuid.UUID (see _portfolio_out).
+    user_id = str(account.user_id)
+    accounts = db.query(m.Account).filter_by(user_id=user_id).order_by(m.Account.created_at).all()
     crypto = next(a for a in accounts if market_of(a) == CRYPTO)
-    crypto_settings = db.query(m.AccountSettings).filter_by(account_id=crypto.id).first()
+    crypto_settings = db.query(m.AccountSettings).filter_by(account_id=str(crypto.id)).first()
     start = crypto_settings.paper_starting_balance if crypto_settings else 1000.0
     floor = crypto_settings.min_balance_floor if crypto_settings else None
     by_market = {market_of(a): a for a in accounts}
@@ -53,7 +58,7 @@ def ensure_portfolios(db: Session, account: m.Account) -> list[PortfolioOut]:
     for market in (METALS, STOCKS):
         if market in by_market:
             continue
-        new = m.Account(user_id=account.user_id, name=market)
+        new = m.Account(user_id=user_id, name=market)
         db.add(new)
         db.flush()
         db.add(m.AccountSettings(
@@ -74,4 +79,8 @@ def ensure_portfolios(db: Session, account: m.Account) -> list[PortfolioOut]:
 def ensure(
     account_id: str, account: m.Account = Depends(require_account_owner), db: Session = Depends(get_db),
 ) -> list[PortfolioOut]:
-    return ensure_portfolios(db, account)
+    try:
+        return ensure_portfolios(db, account)
+    except Exception as e:  # noqa: BLE001 — shown to the account's owner in the app
+        logger.exception("Could not create portfolios for account %s", account_id)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:300]}") from e
