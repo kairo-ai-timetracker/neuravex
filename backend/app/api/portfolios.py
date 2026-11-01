@@ -31,6 +31,15 @@ class PortfolioOut(BaseModel):
     symbols: list[str]
 
 
+def _portfolio_out(market: str, account: m.Account) -> PortfolioOut:
+    # str(): production's id columns are native Postgres UUIDs, which come
+    # back as uuid.UUID (see settings.py's _to_out).
+    return PortfolioOut(
+        market=market, account_id=str(account.id),
+        symbols=[] if market == CRYPTO else symbols_for(market),
+    )
+
+
 def ensure_portfolios(db: Session, account: m.Account) -> list[PortfolioOut]:
     """Creates any missing market portfolio, starting from the crypto
     portfolio's amount and stop so the results can be compared fairly."""
@@ -58,13 +67,7 @@ def ensure_portfolios(db: Session, account: m.Account) -> list[PortfolioOut]:
         by_market[market] = new
     db.flush()
 
-    return [
-        PortfolioOut(
-            market=market, account_id=by_market[market].id,
-            symbols=[] if market == CRYPTO else symbols_for(market),
-        )
-        for market in (CRYPTO, METALS, STOCKS)
-    ]
+    return [_portfolio_out(market, by_market[market]) for market in (CRYPTO, METALS, STOCKS)]
 
 
 @router.post("/{account_id}/ensure", response_model=list[PortfolioOut])

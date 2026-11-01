@@ -1,4 +1,4 @@
-import asyncio
+import uuid
 import unittest
 from datetime import datetime, timezone
 
@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from backend.app.api.portfolios import ensure_portfolios, market_of
+from backend.app.api.portfolios import _portfolio_out, ensure_portfolios, market_of
 from backend.app.api.settings import AccountSettingsUpdate, update_settings
 from backend.app.db.sql_data_store import SqlDataStore
 from backend.app.models import models as m
@@ -47,6 +47,11 @@ class TestPortfolios(unittest.TestCase):
         self.assertEqual(row.symbols, symbols_for("metals"))
         snapshot = self.db.query(m.PortfolioSnapshot).filter_by(account_id=first[1].account_id).one()
         self.assertEqual(snapshot.equity, 11_000.0)
+
+    def test_uuid_ids_from_postgres_are_returned_as_text(self):
+        account_id = uuid.uuid4()
+        out = _portfolio_out("metals", m.Account(id=account_id, user_id="u", name="metals"))
+        self.assertEqual(out.account_id, str(account_id))
 
     def test_market_of_treats_the_original_account_as_crypto(self):
         self.assertEqual(market_of(self.crypto), "crypto")

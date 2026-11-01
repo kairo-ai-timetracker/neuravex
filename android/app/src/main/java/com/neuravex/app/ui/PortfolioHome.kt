@@ -55,19 +55,26 @@ fun PortfolioHome(
     val api = remember { ApiClientFactory.create(configStore.backendBaseUrl!!, SecureCredentialStore(context)) }
     var portfolios by remember { mutableStateOf<List<PortfolioOut>>(emptyList()) }
     var returns by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
+    var loadError by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         while (true) {
             try {
                 if (portfolios.isEmpty()) {
                     val response = api.ensurePortfolios(configStore.accountId!!)
-                    if (response.isSuccessful) portfolios = response.body().orEmpty()
+                    if (response.isSuccessful) {
+                        portfolios = response.body().orEmpty()
+                        loadError = null
+                    } else {
+                        loadError = "Could not load the Metals and Stocks tabs (HTTP ${response.code()})"
+                    }
                 }
                 returns = portfolios.mapNotNull { p ->
                     api.getOverview(p.account_id).body()?.let { p.market to it.daily_pnl_pct }
                 }.toMap()
             } catch (e: Exception) {
                 // The tabs just keep their last numbers until the next round.
+                if (portfolios.isEmpty()) loadError = "Could not load the Metals and Stocks tabs: ${e.javaClass.simpleName}"
             }
             delay(30_000)
         }
@@ -84,6 +91,12 @@ fun PortfolioHome(
                     onOpenSettings = { onOpenSettings(current) },
                 )
             }
+        }
+        loadError?.let { message ->
+            Text(
+                message, color = NeuravexColors.Amber, style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp),
+            )
         }
         if (portfolios.isNotEmpty()) {
             Row(
