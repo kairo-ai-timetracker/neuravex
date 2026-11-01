@@ -37,6 +37,8 @@ class Account(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     name: Mapped[str] = mapped_column(String(100), default="default")
     mode: Mapped[TradingMode] = mapped_column(Enum(TradingMode), default=TradingMode.paper)
+    # Required by the production table (from an earlier schema version).
+    base_currency: Mapped[str] = mapped_column(String(10), default="USDC")
     starting_balance: Mapped[float] = mapped_column(Float, default=1000.0)
     live_trading_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
