@@ -9,6 +9,9 @@ from backend.app.core.config import settings as global_settings
 from backend.app.db.session import get_session
 from backend.app.db.sql_data_store import SqlDataStore
 from backend.app.models import models as m
+from backend.app.api.portfolios import CRYPTO, market_of
+from trading_engine.execution.market_universe import symbols_for
+from trading_engine.execution.yahoo_market_data import YahooMarketData, us_market_is_open
 from trading_engine.execution.route_costs import ROUND_TRIP_COST, slippage_bps_by_symbol
 from trading_engine.agent import AgentConfig, NeuravexAgent, PlannedOrder
 from trading_engine.decision_engine import Decision, ScoreBreakdown
@@ -118,6 +121,7 @@ def _lock_simulation_settings(session, account_settings: m.AccountSettings) -> m
 
 async def _build_paper_exchange(
     symbols: list[str], starting_balances: dict[str, float], starting_cost_basis: dict[str, float],
+    market_data=None,
 ) -> tuple[PaperExchange, dict[str, float]]:
     """
     Seeds a fresh PaperExchange with real market data (candles + last
@@ -127,12 +131,12 @@ async def _build_paper_exchange(
     symbol -> last_price map, so the caller can mark open simulated
     positions to market afterwards without a second round of API calls.
     """
-    market_data = PublicMarketDataExchange()
     # max_price_age_seconds raised from the default 30s: a tick over this
     # many symbols takes ~30-40s end to end (one HTTP call per symbol,
     # sequentially), so the default was tight enough to occasionally
     # flag a price fetched earlier in the same tick as "stale" by the
     # time a later symbol's trade tried to execute against it.
+    market_data = market_data or PublicMarketDataExchange()
     paper = PaperExchange(
         starting_balances=starting_balances, max_price_age_seconds=180,
         slippage_bps_by_symbol=slippage_bps_by_symbol(),
@@ -268,8 +272,10 @@ def _build_agent_for_account(
     an automatic one. Returns (agent, store, exchange, last_prices);
     last_prices is empty for live accounts.
     """
+    market = market_of(account)
     store = SqlDataStore(
         session, simulated=account_settings.paper_trading_enabled,
+        shares_strategy_record=market == CRYPTO,
         fallback_equity=(
             account_settings.paper_starting_balance if account_settings.paper_trading_enabled else None
         ),
@@ -300,6 +306,7 @@ def _build_agent_for_account(
             _build_paper_exchange(
                 price_symbols, starting_balances,
                 account_settings.paper_positions,
+                market_data=None if market == CRYPTO else YahooMarketData(),
             )
         )
         execution_mode = "server"
@@ -311,7 +318,8 @@ def _build_agent_for_account(
         # the user's list for live use.
         # Only coins with a real swap route: anything else would show
         # simulated results that could never happen on-chain.
-        trade_symbols = [sym for sym in (account_settings.symbols or []) if sym in ROUND_TRIP_COST]
+        routable = ROUND_TRIP_COST if market == CRYPTO else symbols_for(market)
+        trade_symbols = [sym for sym in (account_settings.symbols or []) if sym in routable]
         skipped = sorted(set(account_settings.symbols or []) - set(trade_symbols))
         if skipped:
             logger.info("Account %s SIMULATION: skipping pairs without a route %s", account.id, skipped)
@@ -360,7 +368,7 @@ def _build_agent_for_account(
     agent = NeuravexAgent(
         exchange=exchange, strategies=strategies, store=store,
         config=config, account_id=account.id,
-        strategy_performance=_compute_strategy_performance(session),
+        strategy_performance=_compute_strategy_performance(session) if market == CRYPTO else {},
     )
     return agent, store, exchange, last_prices
 
@@ -465,6 +473,14 @@ def run_agent_tick() -> str:
             # the user has switched AI trading on. Only the final
             # execution step is suppressed — see AgentConfig.dry_run and
             # NeuravexAgent's handling of it.
+
+            market = market_of(account)
+            if market != CRYPTO:
+                if not account_settings.paper_trading_enabled:
+                    logger.error("Account %s (%s) is not in simulation — skipping: this market is simulation only", account.id, market)
+                    continue
+                if not us_market_is_open():
+                    continue
 
             account_settings = _lock_simulation_settings(session, account_settings)
             agent, store, exchange, last_prices = _build_agent_for_account(session, account, account_settings)

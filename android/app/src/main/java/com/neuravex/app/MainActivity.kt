@@ -17,7 +17,9 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.neuravex.app.data.AppConfigStore
 import com.neuravex.app.ui.CosmicBackground
-import com.neuravex.app.ui.DashboardScreen
+import com.neuravex.app.data.PortfolioOut
+import com.neuravex.app.ui.MarketSettingsScreen
+import com.neuravex.app.ui.PortfolioHome
 import com.neuravex.app.ui.NeuravexColors
 import com.neuravex.app.ui.OnboardingScreen
 import com.neuravex.app.ui.SettingsScreen
@@ -75,7 +77,7 @@ class MainActivity : FragmentActivity() {
     }
 }
 
-private enum class Screen { Onboarding, Dashboard, Settings }
+private enum class Screen { Onboarding, Dashboard, Settings, MarketSettings }
 
 @Composable
 private fun NeuravexNavHost() {
@@ -91,6 +93,8 @@ private fun NeuravexNavHost() {
         }
     }
     var screen by remember { mutableStateOf(if (configStore.isOnboarded()) Screen.Dashboard else Screen.Onboarding) }
+    var selectedMarket by remember { mutableStateOf("crypto") }
+    var marketPortfolio by remember { mutableStateOf<PortfolioOut?>(null) }
 
     CosmicBackground {
         Crossfade(targetState = screen, label = "screen") { current ->
@@ -99,9 +103,23 @@ private fun NeuravexNavHost() {
                     configStore = configStore,
                     onDone = { screen = Screen.Dashboard },
                 )
-                Screen.Dashboard -> DashboardScreen(
+                Screen.Dashboard -> PortfolioHome(
                     configStore = configStore,
-                    onOpenSettings = { screen = Screen.Settings },
+                    selectedMarket = selectedMarket,
+                    onSelectMarket = { selectedMarket = it },
+                    onOpenSettings = { portfolio ->
+                        if (portfolio == null || portfolio.market == "crypto") {
+                            screen = Screen.Settings
+                        } else {
+                            marketPortfolio = portfolio
+                            screen = Screen.MarketSettings
+                        }
+                    },
+                )
+                Screen.MarketSettings -> MarketSettingsScreen(
+                    configStore = configStore,
+                    portfolio = marketPortfolio!!,
+                    onBack = { screen = Screen.Dashboard },
                 )
                 Screen.Settings -> SettingsScreen(
                     configStore = configStore,

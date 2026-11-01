@@ -186,7 +186,7 @@ fun CountingText(value: Double, format: (Double) -> String, color: Color, style:
 /** Coins as tiles that light up when on: all start on, tap one to switch it off. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun CoinTiles(coins: List<String>, selected: Set<String>, onChange: (Set<String>) -> Unit) {
+fun CoinTiles(coins: List<String>, selected: Set<String>, onChange: (Set<String>) -> Unit, title: String = "Coins the AI may trade") {
     GlassCard(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -194,7 +194,7 @@ fun CoinTiles(coins: List<String>, selected: Set<String>, onChange: (Set<String>
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column {
-                Text("Coins the AI may trade", color = NeuravexColors.Silver, style = MaterialTheme.typography.titleMedium)
+                Text(title, color = NeuravexColors.Silver, style = MaterialTheme.typography.titleMedium)
                 Text("${coins.count { it in selected }} of ${coins.size} on · tap to switch", color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall)
             }
             val allOn = coins.all { it in selected }

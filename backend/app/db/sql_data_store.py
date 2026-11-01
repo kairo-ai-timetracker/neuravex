@@ -125,8 +125,14 @@ def _safe_decision_action(action: str) -> "m.DecisionAction":
 
 
 class SqlDataStore:
-    def __init__(self, session: Session, simulated: bool = False, fallback_equity: float | None = None):
+    def __init__(
+        self, session: Session, simulated: bool = False, fallback_equity: float | None = None,
+        shares_strategy_record: bool = True,
+    ):
         self.session = session
+        # The strategies table holds one track record, built on crypto; other
+        # markets must not move it (the supervisor's history is per account).
+        self.shares_strategy_record = shares_strategy_record
         # Which snapshots count as "this account's portfolio": simulation
         # and live rows share one table and must never mix (see
         # PortfolioSnapshot.is_simulated).
@@ -386,7 +392,8 @@ class SqlDataStore:
         # entry_price is the paper cost basis (buy fee already included);
         # subtract the sell fee too, so a "win" is a win after costs.
         realized = (order_result.average_fill_price - entry_price) * qty - (order_result.fee or 0.0)
-        apply_strategy_result(self.session, opening.contributing_strategies, won=realized > 0, pnl_per_unit=realized / qty)
+        if self.shares_strategy_record:
+            apply_strategy_result(self.session, opening.contributing_strategies, won=realized > 0, pnl_per_unit=realized / qty)
         record_closed_trade(self.session, account_id, opening, realized, simulated=True)
 
     def recent_closed_trades(self, account_id: str) -> list[ClosedTrade]:

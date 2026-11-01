@@ -93,6 +93,13 @@ data class AccountSettingsOut(
 )
 
 @Serializable
+data class PortfolioOut(
+    val market: String,
+    val account_id: String,
+    val symbols: List<String> = emptyList(),
+)
+
+@Serializable
 data class AccountSettingsUpdate(
     val symbols: List<String>? = null,
     val min_balance_floor: Double? = null,

@@ -16,8 +16,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend.app.api.auth import require_account_owner
+from backend.app.api.portfolios import CRYPTO, market_of
 from backend.app.db.session import get_db
 from backend.app.models import models as m
+from trading_engine.execution.market_universe import symbols_for
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -80,6 +82,13 @@ def update_settings(
     # venue. The actual "you need at least one coin" requirement is
     # enforced specifically at the point of enabling ai_enabled below —
     # that's the only moment an empty list is actually a problem.
+    market = market_of(account)
+    if market != CRYPTO:
+        if req.paper_trading_enabled is False:
+            raise HTTPException(status_code=400, detail="This portfolio is simulation only.")
+        if req.symbols is not None and not set(req.symbols) <= set(symbols_for(market)):
+            raise HTTPException(status_code=400, detail="Not part of this portfolio's market.")
+
     if req.execution_venue is not None and req.execution_venue not in ("cex", "wallet"):
         raise HTTPException(status_code=400, detail="execution_venue must be 'cex' or 'wallet'")
 

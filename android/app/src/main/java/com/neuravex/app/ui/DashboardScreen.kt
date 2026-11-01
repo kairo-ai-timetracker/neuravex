@@ -46,11 +46,10 @@ import com.neuravex.app.service.TradingExecutionService
 import kotlinx.coroutines.delay
 
 @Composable
-fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
+fun DashboardScreen(configStore: AppConfigStore, accountId: String, market: String, onOpenSettings: () -> Unit) {
     val context = LocalContext.current
     val credentialStore = remember { SecureCredentialStore(context) }
     val api = remember { ApiClientFactory.create(configStore.backendBaseUrl!!, credentialStore) }
-    val accountId = configStore.accountId!!
 
     var overview by remember { mutableStateOf<AccountOverview?>(null) }
     var positions by remember { mutableStateOf<List<PositionOut>>(emptyList()) }
@@ -178,7 +177,7 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                 }
                 val simulatedCash = overview?.cash ?: 0.0
                 if (simulatedCash > 0.0) {
-                    simulatedTokens + WalletHeldAsset("USDC", "Simulatie", simulatedCash, simulatedCash)
+                    simulatedTokens + WalletHeldAsset(if (market == "crypto") "USDC" else "Cash", "Simulatie", simulatedCash, simulatedCash)
                 } else {
                     simulatedTokens
                 }
@@ -235,7 +234,10 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column {
-                    Text("NEURAVEX", style = MaterialTheme.typography.titleLarge, color = NeuravexColors.Silver, letterSpacing = 4.sp)
+                    Text(
+                        if (market == "crypto") "NEURAVEX" else market.uppercase(),
+                        style = MaterialTheme.typography.titleLarge, color = NeuravexColors.Silver, letterSpacing = 4.sp,
+                    )
                     // Impossible to miss whether real money is at stake —
                     // confusing a simulated loss for a real one (or vice
                     // versa) is exactly what this badge exists to prevent.
@@ -288,6 +290,12 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                 )
+                if (market != "crypto") {
+                    Text(
+                        "Trades only while the US market is open.",
+                        color = NeuravexColors.SilverDim, style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
         }
 
@@ -351,7 +359,7 @@ fun DashboardScreen(configStore: AppConfigStore, onOpenSettings: () -> Unit) {
                         Text("Nothing found in the last wallet check yet.", color = NeuravexColors.SilverDim)
                     }
                     allTokens.forEach { asset -> TokenRow(asset, usdToEurRate) }
-                    balanceDiagnostics?.let { diag ->
+                    balanceDiagnostics?.takeIf { market == "crypto" }?.let { diag ->
                         TextButton(onClick = { showBalanceDetails = !showBalanceDetails }) {
                             Text(if (showBalanceDetails) "Hide technical details" else "Technical details", color = NeuravexColors.SilverDim)
                         }

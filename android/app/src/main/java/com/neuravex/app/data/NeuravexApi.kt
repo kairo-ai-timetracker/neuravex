@@ -50,6 +50,9 @@ interface NeuravexApi {
         @Query("days") days: Int = 14,
     ): Response<List<DailyDecisionStats>>
 
+    @POST("/api/portfolios/{accountId}/ensure")
+    suspend fun ensurePortfolios(@Path("accountId") accountId: String): Response<List<PortfolioOut>>
+
     @GET("/api/settings/{accountId}")
     suspend fun getSettings(@Path("accountId") accountId: String): Response<AccountSettingsOut>
 

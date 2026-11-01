@@ -44,6 +44,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from trading_engine.execution.market_universe import symbols_for, yahoo_ticker
 from trading_engine.execution.route_costs import ROUND_TRIP_COST, slippage_bps_by_symbol
 from trading_engine.supervisor import ClosedTrade as SupervisorTrade
 from trading_engine.agent import AgentConfig, NeuravexAgent  # noqa: E402
@@ -72,6 +73,35 @@ WARMUP_HOURS = 320
 
 
 # ---------------------------------------------------------------- data ----
+
+def fetch_yahoo_1h(symbol: str, start: int, end: int, cache_dir: Path) -> np.ndarray:
+    """Same row shape as fetch_5m, hourly, from Yahoo (keeps ~2 years of 1h bars)."""
+    cache = cache_dir / f"yahoo-{symbol.replace('/', '-')}_{start}_{end}.json"
+    if cache.exists():
+        return np.array(json.loads(cache.read_text()))
+    r = httpx.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker(symbol)}",
+        params={"interval": "1h", "period1": start, "period2": end},
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=30,
+    )
+    r.raise_for_status()
+    result = r.json()["chart"]["result"][0]
+    quote = result["indicators"]["quote"][0]
+    data = [
+        [int(t), o, h, l, c, v or 0]
+        for t, o, h, l, c, v in zip(result["timestamp"], quote["open"], quote["high"], quote["low"], quote["close"], quote["volume"])
+        if None not in (o, h, l, c)
+    ]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(data))
+    return np.array(data)
+
+
+def market_is_open(view: "HourlyView", now: int) -> bool:
+    """A bar ended within the last hour: no trading on stale prices."""
+    i = bisect.bisect_right(view.bar_t, now - view.bar_seconds) - 1
+    return i >= 0 and view.bar_t[i] + view.bar_seconds > now - HOUR
+
 
 def fetch_5m(symbol: str, start: int, end: int, cache_dir: Path) -> np.ndarray:
     """[[t, open, high, low, close, volume], ...] ascending, from Coinbase."""
@@ -122,8 +152,9 @@ class HourlyView:
     """Candles of `tf` seconds (1h by default) as the live feed returns them
     at a given moment: every closed candle plus the still-forming one."""
 
-    def __init__(self, bars: np.ndarray, tf: int = HOUR):
+    def __init__(self, bars: np.ndarray, tf: int = HOUR, bar_seconds: int = BAR):
         self.tf = tf
+        self.bar_seconds = bar_seconds
         self.bar_t = bars[:, 0].astype(int)
         self.bars = bars
         hours = defaultdict(list)
@@ -142,7 +173,7 @@ class HourlyView:
 
     def at(self, now: int, limit: int = 300) -> tuple[list[Candle], float | None]:
         """(candles, last price) known at `now` — bars that ENDED by now."""
-        last_bar = bisect.bisect_right(self.bar_t, now - BAR) - 1
+        last_bar = bisect.bisect_right(self.bar_t, now - self.bar_seconds) - 1
         if last_bar < 0:
             return [], None
         current_hour = now // self.tf * self.tf
@@ -369,9 +400,10 @@ async def replay(args) -> dict:
     tf = {"1h": HOUR, "4h": 4 * HOUR}[args.timeframe]
     views = {}
     for sym in args.symbols:
-        bars = fetch_5m(sym, start - WARMUP_HOURS * tf, end, cache_dir)
+        fetch, bar_seconds = (fetch_5m, BAR) if args.market == "crypto" else (fetch_yahoo_1h, HOUR)
+        bars = fetch(sym, start - WARMUP_HOURS * tf, end, cache_dir)
         if len(bars):
-            views[sym] = HourlyView(bars, tf)
+            views[sym] = HourlyView(bars, tf, bar_seconds)
         else:
             print(f"  (no data for {sym}, skipped)", file=sys.stderr)
 
@@ -415,6 +447,9 @@ async def replay(args) -> dict:
             exchange.update_price(sym, price)
             store.prices[sym] = price
         agent.strategy_performance = store.strategy_performance()
+        if args.market != "crypto" and not any(market_is_open(v, now_ts) for v in views.values()):
+            curve.append((now, store.equity()))
+            continue
 
         halted = False
         if args.mode == "old":
@@ -490,10 +525,13 @@ def main():
     ap.add_argument("--entry-regimes", nargs="+", help="e.g. BULL STRONG_BULL")
     ap.add_argument("--label", help="free text echoed in the result")
     ap.add_argument("--real-costs", action="store_true", help="measured on-chain cost per coin")
+    ap.add_argument("--market", choices=["crypto", "metals", "stocks"], default="crypto")
     ap.add_argument("--exit-ema", type=int, help="sell signals only close below this EMA")
     ap.add_argument("--supervisor", action="store_true", help="feedback layer: stake and strategy gate")
     ap.add_argument("--legacy-regime", action="store_true", help="old 1h volatility/crash assumptions on any timeframe")
     args = ap.parse_args()
+    if args.market != "crypto" and args.symbols == DEFAULT_SYMBOLS:
+        args.symbols = symbols_for(args.market)
     args.take_profit = args.take_profit or None
     print(json.dumps(asyncio.run(replay(args)), indent=2))
 
