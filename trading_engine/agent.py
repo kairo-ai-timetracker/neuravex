@@ -153,6 +153,13 @@ class AgentConfig:
     # below this EMA, so a dip inside a rising trend doesn't end the trade.
     # Stop-losses and circuit breakers are not affected.
     signal_exit_ema: int | None = None
+    # If set, new positions only open while the price is above this EMA, and
+    # (breadth) while at least this share of the market's symbols is above
+    # it. Too little history counts as "not above". Exits are never filtered.
+    entry_trend_ema: int | None = None
+    entry_min_breadth: float | None = None
+    # Stop distance in ATRs, used for both sizing and the stop itself.
+    stop_atr_multiple: float = 1.5
 
 
 class NeuravexAgent:
@@ -180,6 +187,8 @@ class NeuravexAgent:
         # Symbols past analysis_log_window_seconds on this tick.
         self._quiet_symbols: set[str] = set()
         self._verdict = SupervisorVerdict()
+        # Share of symbols above entry_trend_ema, worked out once per tick.
+        self._breadth: float | None = None
 
     async def run_tick(self) -> list[Decision]:
         decisions: list[Decision] = []
@@ -226,6 +235,7 @@ class NeuravexAgent:
             return decisions
 
         self._verdict = self._load_supervisor_verdict()
+        self._breadth = None
         for symbol in self.config.symbols:
             try:
                 decision = await self._process_symbol(symbol, state)
@@ -395,6 +405,20 @@ class NeuravexAgent:
                     f"{', '.join(self.config.entry_regimes)}"
                 )
                 return decision
+            trend_ema = self.config.entry_trend_ema
+            if trend_ema is not None and not _above_ema(data.close, trend_ema):
+                decision.action = "NO_TRADE"
+                decision.reasons_against.append(f"Price is below its EMA{trend_ema} — no new positions against the trend")
+                return decision
+            min_breadth = self.config.entry_min_breadth
+            if min_breadth is not None and trend_ema is not None:
+                breadth = await self._market_breadth(trend_ema)
+                if breadth < min_breadth:
+                    decision.action = "NO_TRADE"
+                    decision.reasons_against.append(
+                        f"Only {breadth:.0%} of this market is above its EMA{trend_ema} — entries need {min_breadth:.0%}"
+                    )
+                    return decision
 
             allowed = [
                 s for s in decision.contributing_signals
@@ -409,7 +433,9 @@ class NeuravexAgent:
 
         entry = current_price
         atr_value = float(atr(data.high, data.low, data.close)[-1])
-        plan = build_risk_plan(entry=entry, direction=direction, atr_value=atr_value)
+        plan = build_risk_plan(
+            entry=entry, direction=direction, atr_value=atr_value, atr_stop_multiplier=self.config.stop_atr_multiple,
+        )
 
         # Spot-only guard: a SHORT cannot be opened without already holding
         # the asset (spec's spot_only=True default in backtesting/live).
@@ -697,6 +723,17 @@ class NeuravexAgent:
         state.open_positions.pop(symbol, None)
         state.last_signal_time_by_symbol[symbol] = self._now()
 
+    async def _market_breadth(self, period: int) -> float:
+        if self._breadth is None:
+            above = 0
+            for symbol in self.config.symbols:
+                candles = await self.exchange.get_candles(symbol, self.config.timeframe, self.config.candle_limit)
+                if self.config.closed_candles_only:
+                    candles = self._closed_candles(candles)
+                above += _above_ema(np.array([c.close for c in candles]), period)
+            self._breadth = above / len(self.config.symbols)
+        return self._breadth
+
     def _timeframe_seconds(self) -> int:
         seconds = _TIMEFRAME_SECONDS.get(self.config.timeframe)
         if seconds is None:
@@ -742,6 +779,10 @@ class NeuravexAgent:
         while end and self._candle_close_time(candles[end - 1]) > now:
             end -= 1
         return candles[:end]
+
+
+def _above_ema(closes: np.ndarray, period: int) -> bool:
+    return len(closes) >= period and bool(closes[-1] > ema(closes, period)[-1])
 
 
 def _as_naive_utc(ts: datetime) -> datetime:

@@ -119,6 +119,20 @@ def _lock_simulation_settings(session, account_settings: m.AccountSettings) -> m
     )
 
 
+# Trend filter, market breadth and a wider stop, per market. Chosen on older data,
+# then confirmed on Nov 2025 - Oct 2026 against the previous settings (replay):
+# crypto -17.8% -> +19.4% (but +2,107 of it from UNI alone), stocks -10.2% -> -1.8%.
+# Metals did worse with them (+25.1% -> +22.1%), so metals keeps the old rules.
+_ENTRY_RULES = {
+    "metals": {},
+}
+_DEFAULT_ENTRY_RULES = {"entry_trend_ema": 200, "entry_min_breadth": 0.5, "stop_atr_multiple": 3.0}
+
+
+def _entry_rules(market: str) -> dict:
+    return _ENTRY_RULES.get(market, _DEFAULT_ENTRY_RULES)
+
+
 async def _build_paper_exchange(
     symbols: list[str], starting_balances: dict[str, float], starting_cost_basis: dict[str, float],
     market_data=None,
@@ -176,13 +190,13 @@ def _closed_candles(candles: list, timeframe_seconds: int = _TIMEFRAME_SECONDS) 
 
 async def _apply_simulated_exits(
     exchange: PaperExchange, store: SqlDataStore, account_id: str,
-    last_prices: dict[str, float], take_profit_usdc: float | None,
+    last_prices: dict[str, float], take_profit_usdc: float | None, stop_atr_multiple: float = 1.5,
 ) -> None:
     """
     Per-position exits for SIMULATION, run after the normal tick so it
     also sees positions that tick just opened:
-      - stop-loss: 1.5 x ATR below the cost basis (the stop agent.py
-        already computes at entry but never enforced), and
+      - stop-loss: stop_atr_multiple x ATR below the cost basis (the stop
+        agent.py already computes at entry but never enforced), and
       - the user's per-trade take-profit (max_balance_target), now judged
         on profit NET of the sell's own fee + slippage.
     See trading_engine/risk/exits.py for both rules. Each other position
@@ -203,7 +217,7 @@ async def _apply_simulated_exits(
         candles = _closed_candles(await exchange.get_candles(symbol, _TIMEFRAME, _CANDLE_LIMIT))
         stop = atr_stop_price(
             entry_price, np.array([c.high for c in candles]), np.array([c.low for c in candles]),
-            np.array([c.close for c in candles]),
+            np.array([c.close for c in candles]), stop_atr_multiple,
         )
         exit_ = evaluate_exit(
             quantity=quantity, cost_basis=entry_price, price=price, stop_price=stop,
@@ -364,6 +378,7 @@ def _build_agent_for_account(
         supervisor_enabled=True,
         signal_exit_ema=20,
         round_trip_cost_by_symbol=ROUND_TRIP_COST,
+        **_entry_rules(market),
     )
     agent = NeuravexAgent(
         exchange=exchange, strategies=strategies, store=store,
@@ -496,6 +511,7 @@ def run_agent_tick() -> str:
                     asyncio.run(
                         _apply_simulated_exits(
                             exchange, store, account.id, last_prices, account_settings.max_balance_target,
+                            _entry_rules(market).get("stop_atr_multiple", 1.5),
                         )
                     )
                     _persist_paper_state(store, account.id, account_settings, exchange, last_prices)

@@ -361,7 +361,7 @@ def _exit_decision(symbol: str, reason: str, detail: str) -> Decision:
 
 
 async def exit_sweep(mode: str, exchange: ReplayExchange, store: ReplayStore, views: dict, now_ts: int,
-                     take_profit: float | None) -> None:
+                     take_profit: float | None, stop_atr: float = 1.5) -> None:
     """Mirrors tasks.py's simulated exit sweep (new) or the old
     _apply_per_trade_take_profit (old)."""
     basis = exchange.get_cost_basis()
@@ -380,7 +380,7 @@ async def exit_sweep(mode: str, exchange: ReplayExchange, store: ReplayStore, vi
         candles, _ = views[symbol].at(now_ts)
         closed = [c for c in candles if c.open_time.timestamp() + views[symbol].tf <= now_ts]
         stop = atr_stop_price(basis[asset], np.array([c.high for c in closed]),
-                              np.array([c.low for c in closed]), np.array([c.close for c in closed]))
+                              np.array([c.low for c in closed]), np.array([c.close for c in closed]), stop_atr)
         exit_ = evaluate_exit(quantity=qty, cost_basis=basis[asset], price=price, stop_price=stop,
                               take_profit_usdc=take_profit)
         if exit_ is None:
@@ -401,7 +401,9 @@ async def replay(args) -> dict:
     views = {}
     for sym in args.symbols:
         fetch, bar_seconds = (fetch_5m, BAR) if args.market == "crypto" else (fetch_yahoo_1h, HOUR)
-        bars = fetch(sym, start - WARMUP_HOURS * tf, end, cache_dir)
+        # Markets are open ~40 hours a week, so the same number of candles spans about 3x the time.
+        warmup = WARMUP_HOURS * tf * (1 if args.market == "crypto" else 3)
+        bars = fetch(sym, start - warmup, end, cache_dir)
         if len(bars):
             views[sym] = HourlyView(bars, tf, bar_seconds)
         else:
@@ -427,6 +429,7 @@ async def replay(args) -> dict:
         supervisor_enabled=args.supervisor,
         signal_exit_ema=args.exit_ema,
         round_trip_cost_by_symbol=ROUND_TRIP_COST if args.real_costs else None,
+        entry_trend_ema=args.trend_ema, entry_min_breadth=args.breadth, stop_atr_multiple=args.stop_atr,
     )
     strategies = [TrendFollowingStrategy(), MomentumStrategy(), MeanReversionStrategy(), BreakoutStrategy()]
     agent = NeuravexAgent(exchange=exchange, strategies=strategies, store=store, config=config,
@@ -467,7 +470,7 @@ async def replay(args) -> dict:
         if halted:
             halted_steps += 1
             first_halt = first_halt or now
-        await exit_sweep(args.mode, exchange, store, views, now_ts, args.take_profit)
+        await exit_sweep(args.mode, exchange, store, views, now_ts, args.take_profit, args.stop_atr)
 
         equity = store.equity()
         store.equity_history.append((now, equity))
@@ -529,6 +532,9 @@ def main():
     ap.add_argument("--exit-ema", type=int, help="sell signals only close below this EMA")
     ap.add_argument("--supervisor", action="store_true", help="feedback layer: stake and strategy gate")
     ap.add_argument("--legacy-regime", action="store_true", help="old 1h volatility/crash assumptions on any timeframe")
+    ap.add_argument("--trend-ema", type=int, help="new positions only above this EMA")
+    ap.add_argument("--breadth", type=float, help="new positions only if this share of symbols is above --trend-ema")
+    ap.add_argument("--stop-atr", type=float, default=1.5, help="stop distance in ATRs")
     args = ap.parse_args()
     if args.market != "crypto" and args.symbols == DEFAULT_SYMBOLS:
         args.symbols = symbols_for(args.market)

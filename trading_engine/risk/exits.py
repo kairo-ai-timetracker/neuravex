@@ -40,7 +40,9 @@ class ExitDecision:
     detail: str
 
 
-def atr_stop_price(cost_basis: float, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> float | None:
+def atr_stop_price(
+    cost_basis: float, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, atr_multiple: float = 1.5,
+) -> float | None:
     """
     The same ATR stop agent.py's build_risk_plan sets at entry (1.5 x ATR
     below the entry), recomputed from the position's cost basis and the
@@ -54,7 +56,9 @@ def atr_stop_price(cost_basis: float, highs: np.ndarray, lows: np.ndarray, close
     atr_value = float(atr(highs, lows, closes)[-1])
     if not np.isfinite(atr_value) or atr_value <= 0:
         return None
-    return build_risk_plan(entry=cost_basis, direction="LONG", atr_value=atr_value).stop_loss
+    return build_risk_plan(
+        entry=cost_basis, direction="LONG", atr_value=atr_value, atr_stop_multiplier=atr_multiple,
+    ).stop_loss
 
 
 def net_profit_if_sold(quantity: float, cost_basis: float, price: float, sell_cost_rate: float) -> float:
